@@ -36,3 +36,10 @@ class RecordValidationError(OrbitError):
     """Raised when an orbital record fails schema validation."""
 
     pass
+
+
+class PropagationError(OrbitError):
+    """Raised when orbital propagation fails (e.g. satellite decay, singularity, or invalid time)."""
+
+    pass
+

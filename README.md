@@ -48,7 +48,9 @@ uvicorn app.main:app --reload --port 8000
 - Interactive API Docs: `http://127.0.0.1:8000/docs`
 - Health Check: `http://127.0.0.1:8000/api/health`
 - Orbit Satellite Lookup: `http://127.0.0.1:8000/api/orbit/satellite/25544`
+- Orbit SGP4 Propagation: `http://127.0.0.1:8000/api/orbit/satellite/25544/propagate?time=2026-11-15T05:00:00Z`
 - Orbit Group Lookup: `http://127.0.0.1:8000/api/orbit/group/stations`
+
 
 
 ### 2. Frontend Setup

@@ -1,5 +1,32 @@
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class Vector3D(BaseModel):
+    """3D Cartesian vector in space."""
+
+    x: float = Field(..., description="X component in km or km/s")
+    y: float = Field(..., description="Y component in km or km/s")
+    z: float = Field(..., description="Z component in km or km/s")
+
+
+class PropagationResult(BaseModel):
+    """SGP4 satellite orbital state vector at a specific UTC timestamp."""
+
+    norad_cat_id: int = Field(..., description="NORAD Catalog Number")
+    object_name: str = Field(..., description="Satellite name")
+    timestamp: str = Field(..., description="UTC propagation timestamp in ISO 8601 format")
+    coordinate_frame: str = Field(
+        default="GCRS",
+        description="Geocentric Celestial Reference System (ICRS-aligned geocentric frame)",
+    )
+    position_km: Vector3D = Field(
+        ..., description="Geocentric position vector in kilometres [X, Y, Z]"
+    )
+    velocity_km_per_s: Vector3D = Field(
+        ..., description="Velocity vector in kilometres per second [VX, VY, VZ]"
+    )
 
 
 class OrbitalRecord(BaseModel):
@@ -69,3 +96,23 @@ class OrbitalRecord(BaseModel):
     @classmethod
     def coerce_none_classification(cls, v: Optional[str]) -> str:
         return "U" if v is None else str(v)
+
+    def to_omm_dict(self) -> dict[str, Any]:
+        """Convert record to a CCSDS OMM dictionary formatted for SGP4 ingestion."""
+        data = self.model_dump(by_alias=True)
+
+        # Normalize epoch to %Y-%m-%dT%H:%M:%S.%f format required by sgp4.omm
+        cleaned = self.epoch.strip().rstrip("Z")
+        try:
+            dt = datetime.fromisoformat(cleaned)
+            data["EPOCH"] = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        except Exception:
+            data["EPOCH"] = self.epoch
+
+        # Fallbacks for optional integer fields
+        if data.get("ELEMENT_SET_NO") is None:
+            data["ELEMENT_SET_NO"] = 999
+        if data.get("REV_AT_EPOCH") is None:
+            data["REV_AT_EPOCH"] = 0
+
+        return data
