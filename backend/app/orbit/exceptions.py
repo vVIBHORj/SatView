@@ -43,3 +43,10 @@ class PropagationError(OrbitError):
 
     pass
 
+
+class ObserverError(OrbitError):
+    """Raised when observer coordinates or topocentric geometry calculations fail."""
+
+    pass
+
+

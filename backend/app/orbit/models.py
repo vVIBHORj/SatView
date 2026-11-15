@@ -29,6 +29,67 @@ class PropagationResult(BaseModel):
     )
 
 
+class ObserverLocation(BaseModel):
+    """Geodetic location of a ground observer referenced to the WGS84 ellipsoid."""
+
+    latitude: float = Field(
+        ...,
+        ge=-90.0,
+        le=90.0,
+        description="Observer geodetic latitude in degrees [-90.0, +90.0]",
+        examples=[28.6139],
+    )
+    longitude: float = Field(
+        ...,
+        ge=-180.0,
+        le=180.0,
+        description="Observer geodetic longitude in degrees [-180.0, +180.0]",
+        examples=[77.2090],
+    )
+    elevation_m: float = Field(
+        default=0.0,
+        ge=-500.0,
+        le=9000.0,
+        description="Observer height above WGS84 ellipsoid in metres (default 0.0)",
+        examples=[216.0],
+    )
+
+
+class TopocentricResult(BaseModel):
+    """Topocentric coordinates of a satellite relative to a ground observer."""
+
+    norad_cat_id: int = Field(..., description="NORAD Catalog Number")
+    object_name: str = Field(..., description="Satellite name")
+    timestamp: str = Field(..., description="UTC observation timestamp in ISO 8601 format")
+    observer: ObserverLocation = Field(..., description="Observer location on WGS84 ellipsoid")
+    azimuth_deg: float = Field(
+        ...,
+        ge=0.0,
+        le=360.0,
+        description="Topocentric azimuth in degrees clockwise from True North [0, 360)",
+    )
+    elevation_deg: float = Field(
+        ...,
+        ge=-90.0,
+        le=90.0,
+        description="Topocentric geometric elevation in degrees above local horizon [-90, +90]",
+    )
+    slant_range_km: float = Field(
+        ..., ge=0.0, description="Direct distance (slant range) from observer to satellite in km"
+    )
+    range_rate_km_per_s: Optional[float] = Field(
+        default=None,
+        description="Slant range rate (radial velocity) in km/s (negative = approaching, positive = receding)",
+    )
+    relative_position_km: Vector3D = Field(
+        ..., description="Observer-to-satellite relative position vector in GCRS [X, Y, Z] in km"
+    )
+    relative_velocity_km_per_s: Vector3D = Field(
+        ..., description="Observer-to-satellite relative velocity vector in GCRS [VX, VY, VZ] in km/s"
+    )
+
+
+
 class OrbitalRecord(BaseModel):
     """Orbital element set following CCSDS OMM / CelesTrak GP JSON format."""
 

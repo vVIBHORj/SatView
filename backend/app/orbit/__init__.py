@@ -6,12 +6,20 @@ from app.orbit.exceptions import (
     CelesTrakError,
     CelesTrakRateLimitError,
     CelesTrakTimeoutError,
+    ObserverError,
     OrbitError,
     PropagationError,
     RecordValidationError,
     SatelliteNotFoundError,
 )
-from app.orbit.models import OrbitalRecord, PropagationResult, Vector3D
+from app.orbit.models import (
+    ObserverLocation,
+    OrbitalRecord,
+    PropagationResult,
+    TopocentricResult,
+    Vector3D,
+)
+from app.orbit.observer import ObserverService
 from app.orbit.propagator import OrbitPropagator
 from app.orbit.service import OrbitService
 
@@ -20,8 +28,11 @@ __all__ = [
     "CelesTrakClient",
     "OrbitService",
     "OrbitPropagator",
+    "ObserverService",
     "OrbitalRecord",
     "PropagationResult",
+    "TopocentricResult",
+    "ObserverLocation",
     "Vector3D",
     "OrbitError",
     "CelesTrakError",
@@ -30,4 +41,6 @@ __all__ = [
     "SatelliteNotFoundError",
     "RecordValidationError",
     "PropagationError",
+    "ObserverError",
 ]
+
