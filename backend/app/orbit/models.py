@@ -89,6 +89,83 @@ class TopocentricResult(BaseModel):
     )
 
 
+class PassPoint(BaseModel):
+    """Specific event point in a satellite pass (AOS, LOS, or Culmination)."""
+
+    time: str = Field(..., description="UTC timestamp in ISO 8601 format")
+    azimuth_deg: float = Field(
+        ...,
+        ge=0.0,
+        le=360.0,
+        description="Topocentric azimuth in degrees clockwise from True North [0, 360)",
+    )
+    elevation_deg: float = Field(
+        ...,
+        ge=-90.0,
+        le=90.0,
+        description="Topocentric geometric elevation in degrees above local horizon [-90, +90]",
+    )
+    slant_range_km: float = Field(
+        ..., ge=0.0, description="Direct distance from observer to satellite in km"
+    )
+
+
+class ClosestApproachPoint(BaseModel):
+    """Time of Closest Approach (TCA) / minimum slant range point in a pass."""
+
+    time: str = Field(..., description="UTC timestamp in ISO 8601 format")
+    slant_range_km: float = Field(
+        ..., ge=0.0, description="Minimum slant range from observer in km"
+    )
+    elevation_deg: float = Field(
+        ...,
+        ge=-90.0,
+        le=90.0,
+        description="Topocentric geometric elevation at minimum range in degrees",
+    )
+    azimuth_deg: float = Field(
+        ...,
+        ge=0.0,
+        le=360.0,
+        description="Topocentric azimuth at minimum range in degrees",
+    )
+
+
+class SatellitePass(BaseModel):
+    """Predicted visibility window of a satellite passing above an elevation threshold."""
+
+    pass_id: int = Field(..., ge=1, description="Sequential index of pass in requested window (1-indexed)")
+    aos: PassPoint = Field(..., description="Acquisition of Signal (rise above elevation threshold)")
+    los: PassPoint = Field(..., description="Loss of Signal (fall below elevation threshold)")
+    max_elevation: PassPoint = Field(..., description="Culmination / point of maximum geometric elevation")
+    closest_approach: ClosestApproachPoint = Field(
+        ..., description="Time of Closest Approach (minimum slant range)"
+    )
+    duration_s: float = Field(..., ge=0.0, description="Pass duration in seconds (between AOS and LOS)")
+    is_complete: bool = Field(
+        ...,
+        description="True if both AOS and LOS occurred within requested window; False if truncated by boundaries",
+    )
+    is_continuous: bool = Field(
+        default=False,
+        description="True if satellite remained continuously above threshold without rising/setting (e.g. GEO)",
+    )
+
+
+class PassPredictionResult(BaseModel):
+    """Collection of predicted passes for a satellite within a specified observation window."""
+
+    norad_cat_id: int = Field(..., description="NORAD Catalog Number")
+    object_name: str = Field(..., description="Satellite name")
+    observer: ObserverLocation = Field(..., description="Observer location on WGS84 ellipsoid")
+    start_time: str = Field(..., description="Start of observation window in ISO 8601 UTC format")
+    end_time: str = Field(..., description="End of observation window in ISO 8601 UTC format")
+    min_elevation_deg: float = Field(..., description="Configured minimum elevation threshold in degrees")
+    pass_count: int = Field(..., ge=0, description="Number of passes found in the requested window")
+    passes: list[SatellitePass] = Field(default_factory=list, description="List of predicted satellite passes")
+
+
+
 
 class OrbitalRecord(BaseModel):
     """Orbital element set following CCSDS OMM / CelesTrak GP JSON format."""

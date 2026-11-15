@@ -50,3 +50,10 @@ class ObserverError(OrbitError):
     pass
 
 
+class PassPredictionError(OrbitError):
+    """Raised when pass prediction fails (e.g. invalid time window or numerical divergence)."""
+
+    pass
+
+
+

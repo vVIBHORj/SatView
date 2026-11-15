@@ -50,7 +50,9 @@ uvicorn app.main:app --reload --port 8000
 - Orbit Satellite Lookup: `http://127.0.0.1:8000/api/orbit/satellite/25544`
 - Orbit SGP4 Propagation: `http://127.0.0.1:8000/api/orbit/satellite/25544/propagate?time=2026-11-15T05:00:00Z`
 - Orbit Topocentric Observation: `http://127.0.0.1:8000/api/orbit/satellite/25544/observe?lat=28.6139&lon=77.2090&alt_m=216.0`
+- Orbit Pass Prediction: `http://127.0.0.1:8000/api/orbit/satellite/25544/passes?lat=28.6139&lon=77.2090&min_elevation=10.0&days=1.0`
 - Orbit Group Lookup: `http://127.0.0.1:8000/api/orbit/group/stations`
+
 
 
 

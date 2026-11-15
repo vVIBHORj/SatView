@@ -67,6 +67,31 @@ The observer engine computes how a satellite appears to a ground observer at a s
 
 ---
 
+## Satellite Pass Prediction (`PassPredictionService`)
+
+The pass prediction engine identifies when and how a satellite traverses the sky above a specified ground station.
+
+### Core Metrics Computed per Pass
+
+* **AOS (Acquisition of Signal)**: Instant the satellite rises across the configurable minimum elevation threshold (`min_elevation_deg`).
+* **LOS (Loss of Signal)**: Instant the satellite falls below the elevation threshold.
+* **Maximum Elevation (Culmination)**: Peak geometric elevation reached during the pass, with its timestamp, azimuth, and slant range.
+* **Closest Approach (TCA)**: Instant of minimum slant range between observer and satellite, with its timestamp, minimum range in kilometres, elevation, and azimuth.
+  * *Astrodynamics Note*: In eccentric orbits, the instant of maximum angular elevation does **not** coincide with minimum Euclidean slant range (can differ by over 60 seconds). Both points are solved and reported independently.
+* **Duration**: Total time in seconds between AOS and LOS.
+* **Completeness & Continuity Flags**:
+  * `is_complete`: `True` if both AOS and LOS occurred within the requested observation window; `False` if truncated by window boundaries.
+  * `is_continuous`: `True` if the satellite remained continuously above the threshold without setting (e.g. Geostationary satellite overhead).
+
+### Numerical Root-Finding & Optimization
+
+* **Rise / Set Crossing Refinement**: Crossing times are solved using **Brent's method** ($f(t) = \text{el}(t) - h_{\text{min}} = 0$) down to a tolerance of $\Delta t \le 10^{-4}\text{ s}$ ($0.1\text{ ms}$), achieving crossing elevation accuracy of $|h(t) - h_{\text{min}}| < 10^{-4\circ}$ ($0.36\text{ arcsec}$).
+* **Culmination & TCA Optimization**: Solved via **Golden Section search** to $\le 10^{-3}\text{ s}$ ($1\text{ ms}$).
+* **Adaptive Scanning Grid**: Evaluated using vectorized Skyfield array operations: $\Delta t = 20\text{ s}$ for LEO ($P < 2\text{ h}$), and $\Delta t \le 60\text{ s}$ for higher orbits.
+* **Grazing Pass Detection**: Crests nearing the threshold ($\ge h_{\text{min}} - 2.5^\circ$) undergo local golden section extrema checks to capture short grazing passes without sampling gaps.
+
+---
+
 ## Caching & Rate Limits
 
 - **CelesTrak Fair-Use Policy**: Request element sets at most once per update cycle (approximately every 2 hours).
@@ -79,5 +104,6 @@ The observer engine computes how a satellite appears to a ground observer at a s
 1. **Current Orbits Only**: CelesTrak provides current and near-real-time element sets. Historical orbits for past dates require Space-Track (Phase 2).
 2. **Catalog Scope**: Covers public catalog objects only. Classified or unlisted military satellites are omitted.
 3. **Temporal Degradation**: SGP4 is an analytical theory whose accuracy degrades with elapsed time $\Delta t$ from the element set epoch. There is no universal accuracy window: Low Earth Orbit (LEO) satellites experience rapid along-track error accumulation (often several kilometres within 1–2 days or hours during elevated solar activity and atmospheric expansion), whereas high-altitude MEO and GEO satellites with negligible drag retain accuracy over longer periods. Furthermore, active station-keeping maneuvers are unmodeled and immediately invalidate pre-maneuver element sets.
-4. **Pass Predictions & Rise/Set**: Pass search algorithms (identifying AOS, TCA, LOS events over multi-day observation windows) will be implemented in Task 1.4.
+4. **Visual & Optical Pass Classification**: Satellite illumination conditions (sunlit passes, penumbra, Earth eclipse shadow entry/exit, observer twilight/night conditions) are deferred to Task 1.5.
+
 
