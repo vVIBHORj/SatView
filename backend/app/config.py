@@ -24,3 +24,11 @@ CORS_ORIGINS = [
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./satview.db")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+
+# CelesTrak Configuration
+CELESTRAK_BASE_URL = os.getenv(
+    "CELESTRAK_BASE_URL", "https://celestrak.org/NORAD/elements/gp.php"
+)
+CELESTRAK_CACHE_TTL_SECONDS = int(os.getenv("CELESTRAK_CACHE_TTL_SECONDS", "7200"))
+CELESTRAK_TIMEOUT_SECONDS = float(os.getenv("CELESTRAK_TIMEOUT_SECONDS", "10.0"))
+

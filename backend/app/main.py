@@ -11,6 +11,7 @@ from app.config import (
     OLLAMA_MODEL,
     PROJECT_NAME,
 )
+from app.orbit.router import router as orbit_router
 
 app = FastAPI(
     title=PROJECT_NAME,
@@ -25,6 +26,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(orbit_router)
+
 
 
 @app.get("/")
