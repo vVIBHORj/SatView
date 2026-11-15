@@ -1,5 +1,5 @@
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -9,6 +9,7 @@ from app.orbit.cache import TTLCache
 from app.orbit.celestrak import CelesTrakClient
 from app.orbit.exceptions import (
     CelesTrakError,
+    CelesTrakRateLimitError,
     CelesTrakTimeoutError,
     RecordValidationError,
 )
@@ -63,22 +64,48 @@ def test_orbital_record_valid_parsing():
     assert rec.bstar == pytest.approx(0.00019362061)
 
 
-def test_orbital_record_invalid_cat_id():
-    bad_data = {**MOCK_ISS_RAW, "NORAD_CAT_ID": -5}
-    with pytest.raises(Exception):
+def test_orbital_record_null_optional_fields():
+    """Verify that null/None values for optional fields are safely coerced to defaults."""
+    raw = {
+        **MOCK_ISS_RAW,
+        "BSTAR": None,
+        "MEAN_MOTION_DOT": None,
+        "MEAN_MOTION_DDOT": None,
+        "EPHEMERIS_TYPE": None,
+        "CLASSIFICATION_TYPE": None,
+        "ELEMENT_SET_NO": None,
+        "REV_AT_EPOCH": None,
+    }
+    rec = OrbitalRecord.model_validate(raw)
+    assert rec.bstar == 0.0
+    assert rec.mean_motion_dot == 0.0
+    assert rec.mean_motion_ddot == 0.0
+    assert rec.ephemeris_type == 0
+    assert rec.classification_type == "U"
+    assert rec.element_set_no is None
+    assert rec.rev_at_epoch is None
+
+
+@pytest.mark.parametrize(
+    "invalid_patch,expected_err",
+    [
+        ({"NORAD_CAT_ID": 0}, "NORAD catalog ID must be between 1 and 999,999,999"),
+        ({"NORAD_CAT_ID": -10}, "NORAD catalog ID must be between 1 and 999,999,999"),
+        ({"NORAD_CAT_ID": 1000000000}, "NORAD catalog ID must be between 1 and 999,999,999"),
+        ({"ECCENTRICITY": -0.01}, "Eccentricity must be in range [0, 1.0)"),
+        ({"ECCENTRICITY": 1.0}, "Eccentricity must be in range [0, 1.0)"),
+        ({"ECCENTRICITY": 1.25}, "Eccentricity must be in range [0, 1.0)"),
+        ({"INCLINATION": -0.1}, "Inclination must be in range [0.0, 180.0]"),
+        ({"INCLINATION": 180.1}, "Inclination must be in range [0.0, 180.0]"),
+        ({"MEAN_MOTION": 0.0}, "Mean motion must be greater than 0"),
+        ({"MEAN_MOTION": -1.5}, "Mean motion must be greater than 0"),
+    ],
+)
+def test_orbital_record_invalid_parameters_rejected(invalid_patch, expected_err):
+    bad_data = {**MOCK_ISS_RAW, **invalid_patch}
+    with pytest.raises(ValueError) as exc_info:
         OrbitalRecord.model_validate(bad_data)
-
-
-def test_orbital_record_invalid_eccentricity():
-    bad_data = {**MOCK_ISS_RAW, "ECCENTRICITY": -0.1}
-    with pytest.raises(Exception):
-        OrbitalRecord.model_validate(bad_data)
-
-
-def test_orbital_record_invalid_mean_motion():
-    bad_data = {**MOCK_ISS_RAW, "MEAN_MOTION": 0.0}
-    with pytest.raises(Exception):
-        OrbitalRecord.model_validate(bad_data)
+    assert expected_err in str(exc_info.value)
 
 
 # ===================== Cache Tests =====================
@@ -122,6 +149,23 @@ async def test_client_fetch_by_catnr_success():
 
 
 @pytest.mark.anyio
+async def test_client_fetch_single_dict_json():
+    """Verify adapter wraps a single JSON object into a list."""
+    mock_resp = httpx.Response(
+        status_code=200,
+        json=MOCK_ISS_RAW,
+        request=httpx.Request("GET", "https://celestrak.org"),
+    )
+    async_mock = AsyncMock(spec=httpx.AsyncClient)
+    async_mock.get.return_value = mock_resp
+
+    client = CelesTrakClient(client=async_mock)
+    records = await client.fetch_gp_by_catnr(25544)
+    assert len(records) == 1
+    assert records[0]["NORAD_CAT_ID"] == 25544
+
+
+@pytest.mark.anyio
 async def test_client_fetch_404_not_found():
     mock_resp = httpx.Response(
         status_code=404,
@@ -134,6 +178,23 @@ async def test_client_fetch_404_not_found():
     client = CelesTrakClient(client=async_mock)
     records = await client.fetch_gp_by_catnr(999999)
     assert records == []
+
+
+@pytest.mark.anyio
+async def test_client_fetch_403_rate_limit():
+    """Verify HTTP 403 is parsed as distinct CelesTrakRateLimitError."""
+    mock_resp = httpx.Response(
+        status_code=403,
+        text="GP data has not updated since your last successful download. Data is updated once every 2 hours.",
+        request=httpx.Request("GET", "https://celestrak.org"),
+    )
+    async_mock = AsyncMock(spec=httpx.AsyncClient)
+    async_mock.get.return_value = mock_resp
+
+    client = CelesTrakClient(client=async_mock)
+    with pytest.raises(CelesTrakRateLimitError) as exc_info:
+        await client.fetch_gp_by_group("active")
+    assert "rate limit / policy exceeded" in str(exc_info.value)
 
 
 @pytest.mark.anyio
@@ -172,6 +233,22 @@ async def test_client_fetch_network_error():
         await client.fetch_gp_by_catnr(25544)
 
 
+@pytest.mark.anyio
+async def test_client_fetch_malformed_json():
+    mock_resp = httpx.Response(
+        status_code=200,
+        text="[corrupted json data",
+        request=httpx.Request("GET", "https://celestrak.org"),
+    )
+    async_mock = AsyncMock(spec=httpx.AsyncClient)
+    async_mock.get.return_value = mock_resp
+
+    client = CelesTrakClient(client=async_mock)
+    with pytest.raises(CelesTrakError) as exc_info:
+        await client.fetch_gp_by_catnr(25544)
+    assert "Failed to parse CelesTrak JSON" in str(exc_info.value)
+
+
 # ===================== Service Tests =====================
 
 @pytest.mark.anyio
@@ -200,7 +277,34 @@ async def test_service_caching_behavior():
 
 
 @pytest.mark.anyio
+async def test_service_failed_request_not_cached():
+    """Verify that network failures and timeouts are never cached, allowing retries."""
+    mock_client = AsyncMock(spec=CelesTrakClient)
+    mock_client.fetch_gp_by_catnr.side_effect = [
+        CelesTrakTimeoutError("Timeout on first attempt"),
+        [MOCK_ISS_RAW],  # Success on retry
+    ]
+
+    cache = TTLCache(default_ttl_seconds=3600)
+    service = OrbitService(client=mock_client, cache=cache)
+
+    # Attempt 1 fails with timeout
+    with pytest.raises(CelesTrakTimeoutError):
+        await service.get_satellite_by_catnr(25544)
+
+    assert cache.get("catnr:25544") is None
+
+    # Attempt 2 succeeds and caches result
+    rec = await service.get_satellite_by_catnr(25544)
+    assert rec is not None
+    assert rec.norad_cat_id == 25544
+    assert cache.get("catnr:25544") is not None
+    assert mock_client.fetch_gp_by_catnr.call_count == 2
+
+
+@pytest.mark.anyio
 async def test_service_group_lookup_and_individual_cache_priming():
+    """Verify group fetch primes individual satellite caches with 0 extra HTTP requests."""
     mock_client = AsyncMock(spec=CelesTrakClient)
     # Include one valid CSS, one valid ISS, and one invalid record
     invalid_record = {"OBJECT_NAME": "BROKEN", "NORAD_CAT_ID": -1}
@@ -216,10 +320,18 @@ async def test_service_group_lookup_and_individual_cache_priming():
     assert 25544 in cat_ids
     assert 48274 in cat_ids
 
-    # Verify individual cache was primed: lookup for ISS requires 0 client calls
+    # Group fetch should count as 1 call to group endpoint
+    assert mock_client.fetch_gp_by_group.call_count == 1
+
+    # Individual lookups for ISS and CSS are served from primed cache with 0 client calls
     cached_iss = await service.get_satellite_by_catnr(25544, use_cache=True)
     assert cached_iss is not None
     assert cached_iss.object_name == "ISS (ZARYA)"
+
+    cached_css = await service.get_satellite_by_catnr(48274, use_cache=True)
+    assert cached_css is not None
+    assert cached_css.object_name == "CSS (TIANHE)"
+
     assert mock_client.fetch_gp_by_catnr.call_count == 0
 
 
@@ -233,6 +345,20 @@ def test_api_get_satellite_success():
         data = resp.json()
         assert data["NORAD_CAT_ID"] == 25544
         assert data["OBJECT_NAME"] == "ISS (ZARYA)"
+
+
+@pytest.mark.parametrize("invalid_catnr", [-5, 0, 1000000000])
+def test_api_get_satellite_invalid_param_422(invalid_catnr):
+    """FastAPI path validation rejects non-positive or out-of-range catalog numbers."""
+    resp = client.get(f"/api/orbit/satellite/{invalid_catnr}")
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("invalid_group", ["bad%20group!", "group$test", "@special"])
+def test_api_get_group_invalid_param_422(invalid_group):
+    """FastAPI path validation rejects group names with invalid characters."""
+    resp = client.get(f"/api/orbit/group/{invalid_group}")
+    assert resp.status_code == 422
 
 
 def test_api_get_satellite_not_found():
@@ -256,8 +382,23 @@ def test_api_get_group_success():
         assert data[0]["NORAD_CAT_ID"] == 25544
 
 
-def test_api_timeout_handling():
+def test_api_rate_limit_handling_429():
+    with patch("app.orbit.router.orbit_service.get_satellite_by_catnr", new_callable=AsyncMock) as mock_get:
+        mock_get.side_effect = CelesTrakRateLimitError("CelesTrak rate limit / policy exceeded (HTTP 403)")
+        resp = client.get("/api/orbit/satellite/25544")
+        assert resp.status_code == 429
+        assert "rate limit" in resp.json()["detail"].lower()
+
+
+def test_api_timeout_handling_504():
     with patch("app.orbit.router.orbit_service.get_satellite_by_catnr", new_callable=AsyncMock) as mock_get:
         mock_get.side_effect = CelesTrakTimeoutError("Request timed out")
         resp = client.get("/api/orbit/satellite/25544")
         assert resp.status_code == 504
+
+
+def test_api_upstream_error_handling_502():
+    with patch("app.orbit.router.orbit_service.get_satellite_by_catnr", new_callable=AsyncMock) as mock_get:
+        mock_get.side_effect = CelesTrakError("Upstream service error")
+        resp = client.get("/api/orbit/satellite/25544")
+        assert resp.status_code == 502

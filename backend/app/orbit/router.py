@@ -1,8 +1,9 @@
 from typing import Any
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Path, Query, status
 
 from app.orbit.exceptions import (
     CelesTrakError,
+    CelesTrakRateLimitError,
     CelesTrakTimeoutError,
     RecordValidationError,
 )
@@ -19,7 +20,14 @@ orbit_service = OrbitService()
     summary="Get orbital element data for a satellite by NORAD Catalog Number",
 )
 async def get_satellite_by_catnr(
-    catnr: int,
+    catnr: int = Path(
+        ...,
+        ge=1,
+        le=999999999,
+        description="NORAD Catalog Number (1 to 9 digits)",
+        examples=[25544],
+    ),
+
     no_cache: bool = Query(False, description="Bypass cache and force refresh"),
 ) -> Any:
     try:
@@ -32,6 +40,10 @@ async def get_satellite_by_catnr(
         return record
     except HTTPException:
         raise
+    except CelesTrakRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
+        )
     except CelesTrakTimeoutError as exc:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(exc)
@@ -48,12 +60,24 @@ async def get_satellite_by_catnr(
     summary="Get orbital element data for a satellite group (e.g. 'stations', 'visual')",
 )
 async def get_satellites_by_group(
-    group: str,
+    group: str = Path(
+        ...,
+        min_length=1,
+        max_length=50,
+        pattern=r"^[a-zA-Z0-9_\-]+$",
+        description="Satellite group name (e.g. 'stations', 'visual', 'weather')",
+        examples=["stations"],
+    ),
+
     no_cache: bool = Query(False, description="Bypass cache and force refresh"),
 ) -> Any:
     try:
         records = await orbit_service.get_satellites_by_group(group, use_cache=not no_cache)
         return records
+    except CelesTrakRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
+        )
     except CelesTrakTimeoutError as exc:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(exc)

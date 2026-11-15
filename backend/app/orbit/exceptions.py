@@ -13,7 +13,14 @@ class CelesTrakError(OrbitError):
     pass
 
 
+class CelesTrakRateLimitError(CelesTrakError):
+    """Raised when CelesTrak returns HTTP 403 due to fair-use rate limits or 1-download-per-update policy."""
+
+    pass
+
+
 class CelesTrakTimeoutError(CelesTrakError):
+
     """Raised when a request to CelesTrak times out."""
 
     pass

@@ -21,8 +21,13 @@ class OrbitService:
         client: Optional[CelesTrakClient] = None,
         cache: Optional[TTLCache] = None,
     ):
-        self.client = client or CelesTrakClient()
-        self.cache = cache or TTLCache(default_ttl_seconds=CELESTRAK_CACHE_TTL_SECONDS)
+        self.client = client if client is not None else CelesTrakClient()
+        self.cache = (
+            cache
+            if cache is not None
+            else TTLCache(default_ttl_seconds=CELESTRAK_CACHE_TTL_SECONDS)
+        )
+
 
     async def get_satellite_by_catnr(
         self, catnr: int, use_cache: bool = True

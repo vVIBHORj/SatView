@@ -3,7 +3,12 @@ from typing import Any, Optional
 import httpx
 
 from app.config import CELESTRAK_BASE_URL, CELESTRAK_TIMEOUT_SECONDS
-from app.orbit.exceptions import CelesTrakError, CelesTrakTimeoutError
+from app.orbit.exceptions import (
+    CelesTrakError,
+    CelesTrakRateLimitError,
+    CelesTrakTimeoutError,
+)
+
 
 
 class CelesTrakClient:
@@ -52,10 +57,17 @@ class CelesTrakClient:
         if response.status_code == 404 or "No GP data found" in response.text:
             return []
 
+        # 403 Forbidden indicates rate limit / policy enforcement (1 download per 2h)
+        if response.status_code == 403:
+            raise CelesTrakRateLimitError(
+                f"CelesTrak rate limit / policy exceeded (HTTP 403): {response.text.strip()[:200]}"
+            )
+
         if response.status_code != 200:
             raise CelesTrakError(
                 f"CelesTrak returned unexpected HTTP status {response.status_code}: {response.text[:200]}"
             )
+
 
         text = response.text.strip()
         # CelesTrak sometimes returns 200 with error text (e.g. 'Invalid query: ...')

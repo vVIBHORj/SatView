@@ -4,8 +4,10 @@ from app.orbit.cache import TTLCache
 from app.orbit.celestrak import CelesTrakClient
 from app.orbit.exceptions import (
     CelesTrakError,
+    CelesTrakRateLimitError,
     CelesTrakTimeoutError,
     OrbitError,
+
     RecordValidationError,
     SatelliteNotFoundError,
 )
@@ -19,7 +21,9 @@ __all__ = [
     "OrbitalRecord",
     "OrbitError",
     "CelesTrakError",
+    "CelesTrakRateLimitError",
     "CelesTrakTimeoutError",
+
     "SatelliteNotFoundError",
     "RecordValidationError",
 ]
