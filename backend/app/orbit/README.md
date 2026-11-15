@@ -56,5 +56,6 @@ The propagation engine computes satellite ephemerides from validated OMM element
 
 1. **Current Orbits Only**: CelesTrak provides current and near-real-time element sets. Historical orbits for past dates require Space-Track (Phase 2).
 2. **Catalog Scope**: Covers public catalog objects only. Classified or unlisted military satellites are omitted.
-3. **Temporal Validity**: SGP4 accuracy degrades with time away from the element set's epoch ($\pm 3$ to 7 days for LEO; weeks for GEO). Propagation far from epoch ($> 30\text{ days}$) experiences cumulative drag error or decay error code 6 / error code 1.
+3. **Temporal Degradation**: SGP4 is an analytical theory whose accuracy degrades with elapsed time $\Delta t$ from the element set epoch. There is no universal accuracy window: Low Earth Orbit (LEO) satellites experience rapid along-track error accumulation (often several kilometres within 1–2 days or hours during elevated solar activity and atmospheric expansion), whereas high-altitude MEO and GEO satellites with negligible drag retain accuracy over longer periods. Furthermore, active station-keeping maneuvers are unmodeled and immediately invalidate pre-maneuver element sets.
+
 4. **Observer Geometry**: Observer topocentric calculations (Azimuth, Elevation, Range) and pass predictions (rise/set/culmination) are implemented in Task 1.3.

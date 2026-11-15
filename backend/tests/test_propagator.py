@@ -1,8 +1,12 @@
 from datetime import datetime, timezone
 import math
 from unittest.mock import AsyncMock, patch
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from sgp4.api import Satrec, WGS72
+from skyfield.api import EarthSatellite
+from skyfield.sgp4lib import TEME
 
 from app.main import app
 from app.orbit.exceptions import PropagationError
@@ -31,24 +35,49 @@ MOCK_ISS_OMM = {
     "MEAN_MOTION_DDOT": 0.0,
 }
 
-# Synthetic Geostationary Earth Orbit (GEO) satellite elements
-MOCK_GEO_OMM = {
-    "OBJECT_NAME": "COMM-SAT GEO",
-    "OBJECT_ID": "2020-001A",
-    "EPOCH": "2026-11-15T00:00:00.000000",
-    "MEAN_MOTION": 1.0027379,  # ~1 rev per sidereal day
-    "ECCENTRICITY": 0.0001,
-    "INCLINATION": 0.05,
-    "RA_OF_ASC_NODE": 100.0,
-    "ARG_OF_PERICENTER": 20.0,
-    "MEAN_ANOMALY": 50.0,
+# Official AIAA 2006 / Vallado SGP4 verification case (Vanguard 1, NORAD 5)
+# 1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
+# 2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667
+VALLADO_SAT5_OMM = {
+    "OBJECT_NAME": "VANGUARD 1",
+    "OBJECT_ID": "1958-002B",
+    "EPOCH": "2000-06-27T18:50:19.733571",
+    "MEAN_MOTION": 10.82419157,
+    "ECCENTRICITY": 0.1859667,
+    "INCLINATION": 34.2682,
+    "RA_OF_ASC_NODE": 348.7242,
+    "ARG_OF_PERICENTER": 331.7664,
+    "MEAN_ANOMALY": 19.3264,
     "EPHEMERIS_TYPE": 0,
     "CLASSIFICATION_TYPE": "U",
-    "NORAD_CAT_ID": 45000,
-    "ELEMENT_SET_NO": 100,
-    "REV_AT_EPOCH": 2000,
-    "BSTAR": 0.0,
-    "MEAN_MOTION_DOT": 0.0,
+    "NORAD_CAT_ID": 5,
+    "ELEMENT_SET_NO": 475,
+    "REV_AT_EPOCH": 41366,
+    "BSTAR": 0.000028098,
+    "MEAN_MOTION_DOT": 0.00000023,
+    "MEAN_MOTION_DDOT": 0.0,
+}
+
+# Official AIAA 2006 / Vallado SGP4 verification case (GEO satellite 28626)
+# 1 28626U 05008A   06176.46683397 -.00000205  00000-0  10000-3 0  2190
+# 2 28626   0.0019 286.9433 0000335  13.7918  55.6504  1.00270176  4891
+VALLADO_GEO_28626_OMM = {
+    "OBJECT_NAME": "GEO-28626",
+    "OBJECT_ID": "2005-008A",
+    "EPOCH": "2006-06-25T11:12:14.455012",
+    "MEAN_MOTION": 1.00270176,
+    "ECCENTRICITY": 0.0000335,
+    "INCLINATION": 0.0019,
+    "RA_OF_ASC_NODE": 286.9433,
+    "ARG_OF_PERICENTER": 13.7918,
+    "MEAN_ANOMALY": 55.6504,
+    "EPHEMERIS_TYPE": 0,
+    "CLASSIFICATION_TYPE": "U",
+    "NORAD_CAT_ID": 28626,
+    "ELEMENT_SET_NO": 219,
+    "REV_AT_EPOCH": 489,
+    "BSTAR": 0.0001,
+    "MEAN_MOTION_DOT": -0.00000205,
     "MEAN_MOTION_DDOT": 0.0,
 }
 
@@ -58,66 +87,98 @@ def propagator():
     return OrbitPropagator()
 
 
-# ===================== SGP4 Mathematical & Deterministic Tests =====================
+# ===================== SGP4 Mathematical & Independent Reference Tests =====================
 
-def test_propagate_iss_known_reference_state(propagator):
-    """Verify ISS propagation matches deterministic astrodynamics reference numbers."""
+def test_wgs72_gravity_constant_model(propagator):
+    """Verify SGP4 initialization specifically uses the WGS-72 Earth gravity model."""
+    record = OrbitalRecord.model_validate(MOCK_ISS_OMM)
+    sat = EarthSatellite.from_omm(propagator.ts, record.to_omm_dict())
+
+    # WGS-72 standard constants in SGP4
+    assert sat.model.radiusearthkm == pytest.approx(6378.135)
+    assert sat.model.mu == pytest.approx(398600.8)
+    assert sat.model.j2 == pytest.approx(0.001082616)
+
+
+def test_independent_vallado_benchmark_sat5(propagator):
+    """Validate SGP4 against independent Vallado 2006 AIAA benchmark dataset (tcppver.out)."""
+    record = OrbitalRecord.model_validate(VALLADO_SAT5_OMM)
+
+    # Vallado published reference coordinates in tcppver.out for Sat 5 at t = +360.0 min
+    ref_teme_pos_360 = np.array([-7154.03120202, -3783.17682504, -3536.19412294])
+    ref_teme_vel_360 = np.array([4.741887409, -4.151817765, -2.093935425])
+
+    target_iso = "2000-06-28T00:50:19.733571Z"  # epoch + 360 min
+    result = propagator.propagate(record, target_iso)
+
+    # Rotate published reference TEME vector into GCRS at date t
+    t = propagator.ts.utc(2000, 6, 28, 0, 50, 19.733571)
+    R = TEME.rotation_at(t)
+    expected_gcrs_pos = R.T @ ref_teme_pos_360
+    expected_gcrs_vel = R.T @ ref_teme_vel_360
+
+    calc_pos = np.array([result.position_km.x, result.position_km.y, result.position_km.z])
+    calc_vel = np.array([result.velocity_km_per_s.x, result.velocity_km_per_s.y, result.velocity_km_per_s.z])
+
+    # Position error must be < 1 mm (1e-6 km)
+    assert np.linalg.norm(calc_pos - expected_gcrs_pos) < 1e-6
+    # Velocity error must be < 1e-8 km/s
+    assert np.linalg.norm(calc_vel - expected_gcrs_vel) < 1e-8
+
+
+def test_independent_vallado_benchmark_geo_28626(propagator):
+    """Validate GEO satellite SGP4/SDP4 propagation against Vallado 2006 benchmark."""
+    record = OrbitalRecord.model_validate(VALLADO_GEO_28626_OMM)
+
+    # Vallado published reference coordinates in tcppver.out for GEO Sat 28626 at t = 0 min
+    ref_teme_pos_0 = np.array([42080.71852213, -2646.86387436, 0.81851294])
+    ref_teme_vel_0 = np.array([0.193105177, 3.068688251, 0.000438449])
+
+    epoch_iso = "2006-06-25T11:12:14.455012Z"
+    result = propagator.propagate(record, epoch_iso)
+
+    t = propagator.ts.utc(2006, 6, 25, 11, 12, 14.455012)
+    R = TEME.rotation_at(t)
+    expected_gcrs_pos = R.T @ ref_teme_pos_0
+    expected_gcrs_vel = R.T @ ref_teme_vel_0
+
+    calc_pos = np.array([result.position_km.x, result.position_km.y, result.position_km.z])
+    calc_vel = np.array([result.velocity_km_per_s.x, result.velocity_km_per_s.y, result.velocity_km_per_s.z])
+
+    # Position error must be < 1 mm
+    assert np.linalg.norm(calc_pos - expected_gcrs_pos) < 1e-6
+    # Velocity error must be < 1e-8 km/s
+    assert np.linalg.norm(calc_vel - expected_gcrs_vel) < 1e-8
+
+
+def test_coordinate_frame_distinction_teme_vs_gcrs(propagator):
+    """Verify that returned coordinates are genuinely GCRS, distinctly rotated from TEME."""
     record = OrbitalRecord.model_validate(MOCK_ISS_OMM)
     target_time = "2026-11-15T05:00:00Z"
 
     result = propagator.propagate(record, target_time)
 
-    assert isinstance(result, PropagationResult)
-    assert result.norad_cat_id == 25544
-    assert result.object_name == "ISS (ZARYA)"
-    assert result.coordinate_frame == "GCRS"
-    assert result.timestamp == "2026-11-15T05:00:00+00:00"
+    # Calculate raw SGP4 TEME coordinates
+    t = propagator.ts.utc(2026, 11, 15, 5, 0, 0)
+    sat = EarthSatellite.from_omm(propagator.ts, record.to_omm_dict())
+    r_teme, v_teme, err = sat._position_and_velocity_TEME_km(t)
 
-    # Known reference coordinates for this epoch and target
-    assert result.position_km.x == pytest.approx(1184.616, abs=0.1)
-    assert result.position_km.y == pytest.approx(-6589.511, abs=0.1)
-    assert result.position_km.z == pytest.approx(1138.189, abs=0.1)
+    calc_gcrs_pos = np.array([result.position_km.x, result.position_km.y, result.position_km.z])
+    calc_gcrs_vel = np.array([result.velocity_km_per_s.x, result.velocity_km_per_s.y, result.velocity_km_per_s.z])
 
-    # Physical verification: LEO orbit radius ~6,791 km (altitude ~413 km above 6378 km Earth radius)
-    r = math.sqrt(
-        result.position_km.x**2 + result.position_km.y**2 + result.position_km.z**2
-    )
-    assert r == pytest.approx(6791.2, abs=1.0)
+    # Physical distinction: precession & nutation between J2000 (GCRS) and 2026 (TEME)
+    # produce a physical vector difference of ~37.4 km for the ISS
+    frame_diff_km = np.linalg.norm(calc_gcrs_pos - r_teme)
+    assert frame_diff_km > 30.0  # Confirms result is NOT mistakenly returned in raw TEME
+    assert frame_diff_km == pytest.approx(37.4, abs=1.0)
 
-    # Known reference velocity vectors
-    assert result.velocity_km_per_s.x == pytest.approx(4.587, abs=0.05)
-    assert result.velocity_km_per_s.y == pytest.approx(1.846, abs=0.05)
-    assert result.velocity_km_per_s.z == pytest.approx(5.860, abs=0.05)
+    # Exact rotation verification: GCRS must match R^T @ TEME to nanometre precision
+    R = TEME.rotation_at(t)
+    expected_gcrs_pos = R.T @ r_teme
+    expected_gcrs_vel = R.T @ v_teme
 
-    # Physical verification: LEO circular orbital speed ~7.67 km/s
-    v = math.sqrt(
-        result.velocity_km_per_s.x**2
-        + result.velocity_km_per_s.y**2
-        + result.velocity_km_per_s.z**2
-    )
-    assert v == pytest.approx(7.668, abs=0.05)
-
-
-def test_propagate_geo_satellite_physics(propagator):
-    """Verify geostationary satellite produces GEO altitude (~35,786 km) and speed (~3.07 km/s)."""
-    record = OrbitalRecord.model_validate(MOCK_GEO_OMM)
-    target_time = datetime(2026, 11, 15, 6, 0, 0, tzinfo=timezone.utc)
-
-    result = propagator.propagate(record, target_time)
-
-    # GEO orbital radius: ~42,164 km
-    r = math.sqrt(
-        result.position_km.x**2 + result.position_km.y**2 + result.position_km.z**2
-    )
-    assert r == pytest.approx(42164.0, rel=0.02)
-
-    # GEO orbital velocity: ~3.075 km/s
-    v = math.sqrt(
-        result.velocity_km_per_s.x**2
-        + result.velocity_km_per_s.y**2
-        + result.velocity_km_per_s.z**2
-    )
-    assert v == pytest.approx(3.075, rel=0.02)
+    assert np.linalg.norm(calc_gcrs_pos - expected_gcrs_pos) < 1e-9
+    assert np.linalg.norm(calc_gcrs_vel - expected_gcrs_vel) < 1e-12
 
 
 # ===================== Timestamp Handling Tests =====================
@@ -126,6 +187,17 @@ def test_propagate_timestamp_iso_z_suffix(propagator):
     record = OrbitalRecord.model_validate(MOCK_ISS_OMM)
     result = propagator.propagate(record, "2026-11-15T05:00:00Z")
     assert result.timestamp == "2026-11-15T05:00:00+00:00"
+
+
+def test_propagate_timestamp_fractional_seconds(propagator):
+    """Verify timestamps with fractional seconds and explicit offsets are handled cleanly."""
+    record = OrbitalRecord.model_validate(MOCK_ISS_OMM)
+    result = propagator.propagate(record, "2026-11-15T05:00:00.123456Z")
+    assert result.timestamp == "2026-11-15T05:00:00.123456+00:00"
+
+    # Non-UTC offset with fractional seconds (10:30:00.5 IST -> 05:00:00.5 UTC)
+    result_ist = propagator.propagate(record, "2026-11-15T10:30:00.500000+05:30")
+    assert result_ist.timestamp == "2026-11-15T05:00:00.500000+00:00"
 
 
 def test_propagate_timestamp_timezone_offset(propagator):
@@ -160,7 +232,6 @@ def test_propagate_decayed_satellite_raises_error(propagator):
     with pytest.raises(PropagationError) as exc_info:
         propagator.propagate(record, decay_time)
     assert "sgp4 propagation error" in str(exc_info.value).lower()
-
 
 
 def test_propagate_epoch_normalization_missing_microseconds(propagator):
