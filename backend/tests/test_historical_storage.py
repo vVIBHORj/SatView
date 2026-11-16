@@ -161,6 +161,45 @@ def test_fingerprint_creation_date_utc_normalization() -> None:
     assert fp1 == fp2 == fp3
 
 
+def test_fingerprint_source_override_distinguishes_non_gpid(memory_storage: OrbitStorage) -> None:
+    """Same orbital record inserted with two different explicit source overrides must have distinct non-GP_ID fingerprints."""
+    rec = make_history_record(gp_id=None, source="source_default")
+
+    # Insert with first source override
+    res1 = memory_storage.insert_history_record(rec, source="override_alpha")
+    assert res1 is True
+    fp_alpha = rec.fingerprint
+
+    # Same record inserted with second source override
+    res2 = memory_storage.insert_history_record(rec, source="override_beta")
+    assert res2 is True
+    fp_beta = rec.fingerprint
+
+    assert fp_alpha != fp_beta
+    assert memory_storage.count_history_records() == 2
+
+
+def test_fingerprint_effective_source_equivalence() -> None:
+    """Same effective source supplied through record.source and explicit argument must produce the same fingerprint."""
+    rec1 = make_history_record(gp_id=None, source="space-track-archive")
+    rec2 = make_history_record(gp_id=None, source="other-placeholder")
+
+    fp_from_rec = compute_record_fingerprint(rec1)
+    fp_from_arg = compute_record_fingerprint(rec2, source="space-track-archive")
+
+    assert fp_from_rec == fp_from_arg
+
+
+def test_fingerprint_gpid_unaffected_by_source_override() -> None:
+    """GP_ID records retain identical gpid-based identity regardless of source override."""
+    rec = make_history_record(gp_id=45678, source="source_original")
+
+    fp_default = compute_record_fingerprint(rec)
+    fp_override = compute_record_fingerprint(rec, source="source_custom_override")
+
+    assert fp_default == fp_override == "gpid:45678"
+
+
 # ---------------------------------------------------------------------------
 # 2. Schema and Single Record Insertion Tests
 # ---------------------------------------------------------------------------
@@ -504,38 +543,110 @@ def test_checkpoint_crud_lifecycle(memory_storage: OrbitStorage) -> None:
     assert memory_storage.list_checkpoints() == []
 
 
-def test_checkpoint_coalesces_missing_earliest_epoch_on_update(memory_storage: OrbitStorage) -> None:
-    """Updating a checkpoint with partial fields preserves existing earliest_epoch bounds."""
-    # Initial checkpoint with earliest epoch recorded
-    cp1 = IngestionCheckpoint(
-        norad_cat_id=25544,
-        source="space-track",
+def test_checkpoint_cumulative_bounds_preservation(memory_storage: OrbitStorage) -> None:
+    """UPSERT_CHECKPOINT_SQL preserves true cumulative min/max epoch bounds and timestamp pairing."""
+    # 1. First checkpoint insertion with missing bounds
+    cp_init_missing = IngestionCheckpoint(
+        norad_cat_id=12345,
+        source="archive_test",
+        status="pending",
+        last_attempt_at="2024-01-01T00:00:00Z",
+    )
+    memory_storage.save_checkpoint(cp_init_missing)
+
+    cp0 = memory_storage.get_checkpoint(12345, "archive_test")
+    assert cp0 is not None
+    assert cp0.earliest_epoch is None
+    assert cp0.earliest_epoch_timestamp is None
+    assert cp0.latest_epoch is None
+    assert cp0.latest_epoch_timestamp is None
+
+    # 2. Update with initial valid bounds [2022-01-01, 2023-01-01]
+    cp_with_bounds = IngestionCheckpoint(
+        norad_cat_id=12345,
+        source="archive_test",
+        status="in_progress",
+        earliest_epoch="2022-01-01T00:00:00Z",
+        latest_epoch="2023-01-01T00:00:00Z",
+        record_count=100,
+        last_attempt_at="2024-01-01T01:00:00Z",
+    )
+    memory_storage.save_checkpoint(cp_with_bounds)
+
+    cp1 = memory_storage.get_checkpoint(12345, "archive_test")
+    assert cp1 is not None
+    assert cp1.earliest_epoch == "2022-01-01T00:00:00Z"
+    assert cp1.latest_epoch == "2023-01-01T00:00:00Z"
+    assert cp1.earliest_epoch_timestamp == parse_epoch_timestamp("2022-01-01T00:00:00Z")
+    assert cp1.latest_epoch_timestamp == parse_epoch_timestamp("2023-01-01T00:00:00Z")
+
+    # 3. Existing bounds followed by checkpoint containing newer bounds:
+    # Incoming earliest is 2022-06-01 (newer than 2022-01-01), latest is 2024-01-01 (newer than 2023-01-01)
+    # Earliest must retain MIN (2022-01-01), Latest must retain MAX (2024-01-01)
+    cp_newer = IngestionCheckpoint(
+        norad_cat_id=12345,
+        source="archive_test",
+        status="in_progress",
+        earliest_epoch="2022-06-01T00:00:00Z",
+        latest_epoch="2024-01-01T00:00:00Z",
+        record_count=200,
+        last_attempt_at="2024-01-01T02:00:00Z",
+    )
+    memory_storage.save_checkpoint(cp_newer)
+
+    cp2 = memory_storage.get_checkpoint(12345, "archive_test")
+    assert cp2 is not None
+    assert cp2.earliest_epoch == "2022-01-01T00:00:00Z"
+    assert cp2.latest_epoch == "2024-01-01T00:00:00Z"
+    assert cp2.earliest_epoch_timestamp == parse_epoch_timestamp("2022-01-01T00:00:00Z")
+    assert cp2.latest_epoch_timestamp == parse_epoch_timestamp("2024-01-01T00:00:00Z")
+
+    # 4. Existing bounds followed by checkpoint containing older bounds:
+    # Incoming earliest is 2020-01-01 (older than 2022-01-01), latest is 2023-06-01 (older than 2024-01-01)
+    # Earliest must expand to MIN (2020-01-01), Latest must retain MAX (2024-01-01)
+    cp_older = IngestionCheckpoint(
+        norad_cat_id=12345,
+        source="archive_test",
         status="in_progress",
         earliest_epoch="2020-01-01T00:00:00Z",
-        latest_epoch="2021-01-01T00:00:00Z",
-        record_count=100,
-        last_attempt_at="2024-01-01T10:00:00Z",
+        latest_epoch="2023-06-01T00:00:00Z",
+        record_count=300,
+        last_attempt_at="2024-01-01T03:00:00Z",
     )
-    memory_storage.save_checkpoint(cp1)
+    memory_storage.save_checkpoint(cp_older)
 
-    # Next update with only latest_epoch specified (earliest_epoch is None)
-    cp2 = IngestionCheckpoint(
-        norad_cat_id=25544,
-        source="space-track",
-        status="in_progress",
+    cp3 = memory_storage.get_checkpoint(12345, "archive_test")
+    assert cp3 is not None
+    assert cp3.earliest_epoch == "2020-01-01T00:00:00Z"
+    assert cp3.latest_epoch == "2024-01-01T00:00:00Z"
+    assert cp3.earliest_epoch_timestamp == parse_epoch_timestamp("2020-01-01T00:00:00Z")
+    assert cp3.latest_epoch_timestamp == parse_epoch_timestamp("2024-01-01T00:00:00Z")
+
+    # 5. NULL incoming bounds: neither earliest nor latest is specified
+    # Must preserve existing cumulative bounds intact
+    cp_null_incoming = IngestionCheckpoint(
+        norad_cat_id=12345,
+        source="archive_test",
+        status="completed",
         earliest_epoch=None,
-        latest_epoch="2022-01-01T00:00:00Z",
-        record_count=250,
-        last_attempt_at="2024-01-01T11:00:00Z",
+        latest_epoch=None,
+        record_count=350,
+        last_attempt_at="2024-01-01T04:00:00Z",
+        completed_at="2024-01-01T04:00:00Z",
     )
-    memory_storage.save_checkpoint(cp2)
+    memory_storage.save_checkpoint(cp_null_incoming)
 
-    updated = memory_storage.get_checkpoint(25544, "space-track")
-    assert updated is not None
-    # Earliest epoch was preserved by COALESCE
-    assert updated.earliest_epoch == "2020-01-01T00:00:00Z"
-    assert updated.latest_epoch == "2022-01-01T00:00:00Z"
-    assert updated.record_count == 250
+    cp4 = memory_storage.get_checkpoint(12345, "archive_test")
+    assert cp4 is not None
+    assert cp4.earliest_epoch == "2020-01-01T00:00:00Z"
+    assert cp4.latest_epoch == "2024-01-01T00:00:00Z"
+    assert cp4.record_count == 350
+    assert cp4.status == "completed"
+    assert cp4.completed_at == "2024-01-01T04:00:00Z"
+
+    # 6. Correct correspondence between epoch strings and numeric timestamps
+    assert cp4.earliest_epoch_timestamp == parse_epoch_timestamp(cp4.earliest_epoch)
+    assert cp4.latest_epoch_timestamp == parse_epoch_timestamp(cp4.latest_epoch)
 
 
 # ---------------------------------------------------------------------------

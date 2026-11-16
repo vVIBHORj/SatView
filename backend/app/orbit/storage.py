@@ -58,7 +58,9 @@ def parse_epoch_timestamp(epoch_str: str) -> float:
     return dt.timestamp()
 
 
-def compute_record_fingerprint(record: HistoricalOrbitalRecord) -> str:
+def compute_record_fingerprint(
+    record: HistoricalOrbitalRecord, source: Optional[str] = None
+) -> str:
     """Compute a deterministic unique fingerprint for an orbital record.
 
     If gp_id is present (from Space-Track), returns 'gpid:<gp_id>'.
@@ -66,6 +68,8 @@ def compute_record_fingerprint(record: HistoricalOrbitalRecord) -> str:
     """
     if record.gp_id is not None:
         return f"gpid:{record.gp_id}"
+
+    effective_source = source if source is not None else record.source
 
     try:
         epoch_ts = parse_epoch_timestamp(record.epoch)
@@ -93,7 +97,7 @@ def compute_record_fingerprint(record: HistoricalOrbitalRecord) -> str:
         f"{(record.bstar or 0.0):.10e}",
         f"{(record.mean_motion_dot or 0.0):.10e}",
         f"{(record.mean_motion_ddot or 0.0):.10e}",
-        str(record.source or "").lower().strip(),
+        str(effective_source or "").lower().strip(),
         norm_creation_date,
         str(record.element_set_no if record.element_set_no is not None else ""),
         str(record.rev_at_epoch if record.rev_at_epoch is not None else ""),
@@ -321,10 +325,30 @@ INSERT INTO ingestion_checkpoints (
 )
 ON CONFLICT(norad_cat_id, source) DO UPDATE SET
     status = excluded.status,
-    earliest_epoch = COALESCE(excluded.earliest_epoch, ingestion_checkpoints.earliest_epoch),
-    earliest_epoch_timestamp = COALESCE(excluded.earliest_epoch_timestamp, ingestion_checkpoints.earliest_epoch_timestamp),
-    latest_epoch = COALESCE(excluded.latest_epoch, ingestion_checkpoints.latest_epoch),
-    latest_epoch_timestamp = COALESCE(excluded.latest_epoch_timestamp, ingestion_checkpoints.latest_epoch_timestamp),
+    earliest_epoch = CASE
+        WHEN excluded.earliest_epoch_timestamp IS NULL THEN ingestion_checkpoints.earliest_epoch
+        WHEN ingestion_checkpoints.earliest_epoch_timestamp IS NULL THEN excluded.earliest_epoch
+        WHEN excluded.earliest_epoch_timestamp < ingestion_checkpoints.earliest_epoch_timestamp THEN excluded.earliest_epoch
+        ELSE ingestion_checkpoints.earliest_epoch
+    END,
+    earliest_epoch_timestamp = CASE
+        WHEN excluded.earliest_epoch_timestamp IS NULL THEN ingestion_checkpoints.earliest_epoch_timestamp
+        WHEN ingestion_checkpoints.earliest_epoch_timestamp IS NULL THEN excluded.earliest_epoch_timestamp
+        WHEN excluded.earliest_epoch_timestamp < ingestion_checkpoints.earliest_epoch_timestamp THEN excluded.earliest_epoch_timestamp
+        ELSE ingestion_checkpoints.earliest_epoch_timestamp
+    END,
+    latest_epoch = CASE
+        WHEN excluded.latest_epoch_timestamp IS NULL THEN ingestion_checkpoints.latest_epoch
+        WHEN ingestion_checkpoints.latest_epoch_timestamp IS NULL THEN excluded.latest_epoch
+        WHEN excluded.latest_epoch_timestamp > ingestion_checkpoints.latest_epoch_timestamp THEN excluded.latest_epoch
+        ELSE ingestion_checkpoints.latest_epoch
+    END,
+    latest_epoch_timestamp = CASE
+        WHEN excluded.latest_epoch_timestamp IS NULL THEN ingestion_checkpoints.latest_epoch_timestamp
+        WHEN ingestion_checkpoints.latest_epoch_timestamp IS NULL THEN excluded.latest_epoch_timestamp
+        WHEN excluded.latest_epoch_timestamp > ingestion_checkpoints.latest_epoch_timestamp THEN excluded.latest_epoch_timestamp
+        ELSE ingestion_checkpoints.latest_epoch_timestamp
+    END,
     record_count = excluded.record_count,
     last_error = excluded.last_error,
     last_attempt_at = excluded.last_attempt_at,
@@ -574,7 +598,10 @@ class OrbitStorage:
         if creation_date_ts is None and record.creation_date:
             creation_date_ts = parse_epoch_timestamp(record.creation_date)
 
-        fingerprint = record.fingerprint or compute_record_fingerprint(record)
+        if source is not None or record.fingerprint is None:
+            fingerprint = compute_record_fingerprint(record, source=rec_source)
+        else:
+            fingerprint = record.fingerprint
 
         return (
             record.norad_cat_id,
