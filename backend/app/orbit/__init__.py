@@ -16,6 +16,8 @@ from app.orbit.exceptions import (
 )
 from app.orbit.models import (
     ClosestApproachPoint,
+    HistoricalOrbitalRecord,
+    IngestionCheckpoint,
     ObserverLocation,
     OrbitalRecord,
     PassPoint,
@@ -30,7 +32,11 @@ from app.orbit.observer import ObserverService
 from app.orbit.pass_predictor import PassPredictionService
 from app.orbit.propagator import OrbitPropagator
 from app.orbit.service import OrbitService
-from app.orbit.storage import OrbitStorage, parse_epoch_timestamp
+from app.orbit.storage import (
+    OrbitStorage,
+    compute_record_fingerprint,
+    parse_epoch_timestamp,
+)
 
 __all__ = [
     "TTLCache",
@@ -42,6 +48,8 @@ __all__ = [
     "PassPredictionService",
     "OrbitalRecord",
     "StoredOrbitalRecord",
+    "HistoricalOrbitalRecord",
+    "IngestionCheckpoint",
     "PropagationResult",
     "TopocentricResult",
     "ObserverLocation",
@@ -60,6 +68,7 @@ __all__ = [
     "PropagationError",
     "ObserverError",
     "PassPredictionError",
+    "compute_record_fingerprint",
     "parse_epoch_timestamp",
 ]
 

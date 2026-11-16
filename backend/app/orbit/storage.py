@@ -1,15 +1,21 @@
 """Persistent SQLite storage engine for satellite orbital records."""
 
 from datetime import datetime, timezone
+import hashlib
 import logging
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from app.config import DATABASE_URL
 from app.orbit.exceptions import DatabaseError, RecordValidationError
-from app.orbit.models import OrbitalRecord, StoredOrbitalRecord
+from app.orbit.models import (
+    HistoricalOrbitalRecord,
+    IngestionCheckpoint,
+    OrbitalRecord,
+    StoredOrbitalRecord,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +56,50 @@ def parse_epoch_timestamp(epoch_str: str) -> float:
         dt = dt.astimezone(timezone.utc)
 
     return dt.timestamp()
+
+
+def compute_record_fingerprint(record: HistoricalOrbitalRecord) -> str:
+    """Compute a deterministic unique fingerprint for an orbital record.
+
+    If gp_id is present (from Space-Track), returns 'gpid:<gp_id>'.
+    Otherwise, returns SHA-256 hash of canonical orbital parameters and source metadata.
+    """
+    if record.gp_id is not None:
+        return f"gpid:{record.gp_id}"
+
+    try:
+        epoch_ts = parse_epoch_timestamp(record.epoch)
+        norm_epoch = f"{epoch_ts:.6f}"
+    except Exception:
+        norm_epoch = record.epoch.strip()
+
+    norm_creation_date = ""
+    if record.creation_date:
+        try:
+            cd_ts = parse_epoch_timestamp(record.creation_date)
+            norm_creation_date = f"{cd_ts:.6f}"
+        except Exception:
+            norm_creation_date = str(record.creation_date).strip()
+
+    canonical_parts = [
+        str(record.norad_cat_id),
+        norm_epoch,
+        f"{record.mean_motion:.11f}",
+        f"{record.eccentricity:.9f}",
+        f"{record.inclination:.6f}",
+        f"{record.ra_of_asc_node:.6f}",
+        f"{record.arg_of_pericenter:.6f}",
+        f"{record.mean_anomaly:.6f}",
+        f"{(record.bstar or 0.0):.10e}",
+        f"{(record.mean_motion_dot or 0.0):.10e}",
+        f"{(record.mean_motion_ddot or 0.0):.10e}",
+        str(record.source or "").lower().strip(),
+        norm_creation_date,
+        str(record.element_set_no if record.element_set_no is not None else ""),
+        str(record.rev_at_epoch if record.rev_at_epoch is not None else ""),
+    ]
+    canonical_str = "|".join(canonical_parts)
+    return hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
 
 
 CREATE_TABLE_SQL = """
@@ -135,6 +185,152 @@ ON CONFLICT(norad_cat_id) DO UPDATE SET
 WHERE excluded.epoch_timestamp >= orbital_records.epoch_timestamp;
 """
 
+CREATE_HISTORY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS orbital_record_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    norad_cat_id INTEGER NOT NULL,
+    object_name TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    epoch TEXT NOT NULL,
+    epoch_timestamp REAL NOT NULL,
+    mean_motion REAL NOT NULL,
+    eccentricity REAL NOT NULL,
+    inclination REAL NOT NULL,
+    ra_of_asc_node REAL NOT NULL,
+    arg_of_pericenter REAL NOT NULL,
+    mean_anomaly REAL NOT NULL,
+    ephemeris_type INTEGER DEFAULT 0,
+    classification_type TEXT DEFAULT 'U',
+    element_set_no INTEGER,
+    rev_at_epoch INTEGER,
+    bstar REAL DEFAULT 0.0,
+    mean_motion_dot REAL DEFAULT 0.0,
+    mean_motion_ddot REAL DEFAULT 0.0,
+    source TEXT NOT NULL DEFAULT 'space-track',
+    retrieved_at TEXT NOT NULL,
+    creation_date TEXT,
+    creation_date_timestamp REAL,
+    gp_id INTEGER,
+    fingerprint TEXT NOT NULL,
+    semimajor_axis REAL,
+    period REAL,
+    apoapsis REAL,
+    periapsis REAL,
+    decay_date TEXT,
+    tle_line1 TEXT,
+    tle_line2 TEXT
+);
+"""
+
+CREATE_INDEX_HISTORY_NORAD_EPOCH_SQL = """
+CREATE INDEX IF NOT EXISTS idx_history_norad_epoch
+ON orbital_record_history(norad_cat_id, epoch_timestamp ASC, creation_date_timestamp ASC);
+"""
+
+CREATE_INDEX_HISTORY_EPOCH_TS_SQL = """
+CREATE INDEX IF NOT EXISTS idx_history_epoch_ts
+ON orbital_record_history(epoch_timestamp);
+"""
+
+CREATE_INDEX_HISTORY_FINGERPRINT_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_history_fingerprint
+ON orbital_record_history(fingerprint);
+"""
+
+CREATE_INDEX_HISTORY_GP_ID_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_history_gp_id
+ON orbital_record_history(gp_id)
+WHERE gp_id IS NOT NULL;
+"""
+
+CREATE_CHECKPOINTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
+    norad_cat_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    earliest_epoch TEXT,
+    earliest_epoch_timestamp REAL,
+    latest_epoch TEXT,
+    latest_epoch_timestamp REAL,
+    record_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (norad_cat_id, source)
+);
+"""
+
+CREATE_INDEX_CHECKPOINTS_STATUS_SQL = """
+CREATE INDEX IF NOT EXISTS idx_checkpoints_status
+ON ingestion_checkpoints(status);
+"""
+
+INSERT_HISTORY_SQL = """
+INSERT INTO orbital_record_history (
+    norad_cat_id,
+    object_name,
+    object_id,
+    epoch,
+    epoch_timestamp,
+    mean_motion,
+    eccentricity,
+    inclination,
+    ra_of_asc_node,
+    arg_of_pericenter,
+    mean_anomaly,
+    ephemeris_type,
+    classification_type,
+    element_set_no,
+    rev_at_epoch,
+    bstar,
+    mean_motion_dot,
+    mean_motion_ddot,
+    source,
+    retrieved_at,
+    creation_date,
+    creation_date_timestamp,
+    gp_id,
+    fingerprint,
+    semimajor_axis,
+    period,
+    apoapsis,
+    periapsis,
+    decay_date,
+    tle_line1,
+    tle_line2
+) VALUES (
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+) ON CONFLICT DO NOTHING;
+"""
+
+UPSERT_CHECKPOINT_SQL = """
+INSERT INTO ingestion_checkpoints (
+    norad_cat_id,
+    source,
+    status,
+    earliest_epoch,
+    earliest_epoch_timestamp,
+    latest_epoch,
+    latest_epoch_timestamp,
+    record_count,
+    last_error,
+    last_attempt_at,
+    completed_at
+) VALUES (
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+)
+ON CONFLICT(norad_cat_id, source) DO UPDATE SET
+    status = excluded.status,
+    earliest_epoch = COALESCE(excluded.earliest_epoch, ingestion_checkpoints.earliest_epoch),
+    earliest_epoch_timestamp = COALESCE(excluded.earliest_epoch_timestamp, ingestion_checkpoints.earliest_epoch_timestamp),
+    latest_epoch = COALESCE(excluded.latest_epoch, ingestion_checkpoints.latest_epoch),
+    latest_epoch_timestamp = COALESCE(excluded.latest_epoch_timestamp, ingestion_checkpoints.latest_epoch_timestamp),
+    record_count = excluded.record_count,
+    last_error = excluded.last_error,
+    last_attempt_at = excluded.last_attempt_at,
+    completed_at = COALESCE(excluded.completed_at, ingestion_checkpoints.completed_at);
+"""
+
 
 class OrbitStorage:
     """Thread-safe persistent SQLite storage for validated satellite orbital records."""
@@ -171,6 +367,17 @@ class OrbitStorage:
                 self._conn.execute(CREATE_TABLE_SQL)
                 self._conn.execute(CREATE_INDEX_EPOCH_SQL)
                 self._conn.execute(CREATE_INDEX_NAME_SQL)
+
+                # Historical records table and indexes
+                self._conn.execute(CREATE_HISTORY_TABLE_SQL)
+                self._conn.execute(CREATE_INDEX_HISTORY_NORAD_EPOCH_SQL)
+                self._conn.execute(CREATE_INDEX_HISTORY_EPOCH_TS_SQL)
+                self._conn.execute(CREATE_INDEX_HISTORY_FINGERPRINT_SQL)
+                self._conn.execute(CREATE_INDEX_HISTORY_GP_ID_SQL)
+
+                # Ingestion checkpoints table and index
+                self._conn.execute(CREATE_CHECKPOINTS_TABLE_SQL)
+                self._conn.execute(CREATE_INDEX_CHECKPOINTS_STATUS_SQL)
         except sqlite3.Error as exc:
             raise DatabaseError(f"Failed to initialize orbital database schema: {exc}") from exc
 
@@ -344,6 +551,350 @@ class OrbitStorage:
                 conn.execute("DELETE FROM orbital_records")
         except sqlite3.Error as exc:
             raise DatabaseError(f"Failed to clear orbital records: {exc}") from exc
+
+    def _history_record_to_params(
+        self,
+        record: HistoricalOrbitalRecord,
+        source: Optional[str] = None,
+        retrieved_at: Optional[str] = None,
+    ) -> tuple:
+        """Map HistoricalOrbitalRecord fields to parameter tuple for SQL insert."""
+        rec_source = source or record.source or "space-track"
+        rec_retrieved_at = (
+            retrieved_at or record.retrieved_at or datetime.now(timezone.utc).isoformat()
+        )
+
+        epoch_ts = (
+            record.epoch_timestamp
+            if record.epoch_timestamp is not None
+            else parse_epoch_timestamp(record.epoch)
+        )
+
+        creation_date_ts = record.creation_date_timestamp
+        if creation_date_ts is None and record.creation_date:
+            creation_date_ts = parse_epoch_timestamp(record.creation_date)
+
+        fingerprint = record.fingerprint or compute_record_fingerprint(record)
+
+        return (
+            record.norad_cat_id,
+            record.object_name,
+            record.object_id,
+            record.epoch,
+            epoch_ts,
+            record.mean_motion,
+            record.eccentricity,
+            record.inclination,
+            record.ra_of_asc_node,
+            record.arg_of_pericenter,
+            record.mean_anomaly,
+            record.ephemeris_type if record.ephemeris_type is not None else 0,
+            record.classification_type if record.classification_type is not None else "U",
+            record.element_set_no,
+            record.rev_at_epoch,
+            record.bstar if record.bstar is not None else 0.0,
+            record.mean_motion_dot if record.mean_motion_dot is not None else 0.0,
+            record.mean_motion_ddot if record.mean_motion_ddot is not None else 0.0,
+            rec_source,
+            rec_retrieved_at,
+            record.creation_date,
+            creation_date_ts,
+            record.gp_id,
+            fingerprint,
+            record.semimajor_axis,
+            record.period,
+            record.apoapsis,
+            record.periapsis,
+            record.decay_date,
+            record.tle_line1,
+            record.tle_line2,
+        )
+
+    def insert_history_record(
+        self,
+        record: HistoricalOrbitalRecord,
+        source: Optional[str] = None,
+        retrieved_at: Optional[str] = None,
+    ) -> bool:
+        """Insert a single historical orbital record into orbital_record_history.
+
+        Returns:
+            True if inserted.
+            False if skipped because record already exists (duplicate gp_id or fingerprint).
+        """
+        conn = self._check_connection()
+        params = self._history_record_to_params(record, source, retrieved_at)
+
+        try:
+            with self._lock, conn:
+                cur = conn.cursor()
+                cur.execute(INSERT_HISTORY_SQL, params)
+                if cur.rowcount > 0:
+                    record.id = cur.lastrowid
+                    record.fingerprint = params[23]
+                    record.epoch_timestamp = params[4]
+                    record.creation_date_timestamp = params[21]
+                    return True
+                return False
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to insert historical orbital record for NORAD ID {record.norad_cat_id}: {exc}"
+            ) from exc
+
+    def batch_insert_history(
+        self,
+        records: list[HistoricalOrbitalRecord],
+        source: Optional[str] = None,
+        retrieved_at: Optional[str] = None,
+    ) -> tuple[int, int]:
+        """Batch insert historical orbital records in a single atomic transaction.
+
+        Returns:
+            (inserted_count, skipped_count)
+        """
+        if not records:
+            return (0, 0)
+
+        conn = self._check_connection()
+        inserted_count = 0
+        skipped_count = 0
+
+        # Pre-validate and generate parameter tuples before executing transaction
+        prepared_params = [
+            (rec, self._history_record_to_params(rec, source, retrieved_at))
+            for rec in records
+        ]
+
+        try:
+            with self._lock, conn:
+                cur = conn.cursor()
+                for rec, params in prepared_params:
+                    cur.execute(INSERT_HISTORY_SQL, params)
+                    if cur.rowcount > 0:
+                        inserted_count += 1
+                        rec.id = cur.lastrowid
+                        rec.fingerprint = params[23]
+                        rec.epoch_timestamp = params[4]
+                        rec.creation_date_timestamp = params[21]
+                    else:
+                        skipped_count += 1
+            return (inserted_count, skipped_count)
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to batch insert historical orbital records: {exc}"
+            ) from exc
+
+    def get_history_record_by_id(self, record_id: int) -> Optional[HistoricalOrbitalRecord]:
+        """Retrieve a historical orbital record by its internal surrogate ID."""
+        conn = self._check_connection()
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM orbital_record_history WHERE id = ?",
+                    (record_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return HistoricalOrbitalRecord.model_validate(dict(row))
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to retrieve historical orbital record ID {record_id}: {exc}"
+            ) from exc
+
+    def get_history_record_by_gp_id(self, gp_id: int) -> Optional[HistoricalOrbitalRecord]:
+        """Retrieve a historical orbital record by Space-Track GP_ID."""
+        conn = self._check_connection()
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM orbital_record_history WHERE gp_id = ?",
+                    (gp_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return HistoricalOrbitalRecord.model_validate(dict(row))
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to retrieve historical orbital record for GP_ID {gp_id}: {exc}"
+            ) from exc
+
+    def query_history_range(
+        self,
+        norad_cat_id: int,
+        start_epoch: Optional[str] = None,
+        end_epoch: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[HistoricalOrbitalRecord]:
+        """Query historical orbital records for a satellite ordered chronologically.
+
+        Args:
+            norad_cat_id: Satellite NORAD catalog number.
+            start_epoch: Optional start of range (inclusive ISO 8601 UTC timestamp).
+            end_epoch: Optional end of range (inclusive ISO 8601 UTC timestamp).
+            limit: Maximum number of records to return (default: 100).
+            offset: Pagination offset (default: 0).
+
+        Returns:
+            List of HistoricalOrbitalRecord ordered by epoch_timestamp ASC,
+            creation_date_timestamp ASC, id ASC.
+        """
+        conn = self._check_connection()
+        query = ["SELECT * FROM orbital_record_history WHERE norad_cat_id = ?"]
+        params: list[Any] = [norad_cat_id]
+
+        if start_epoch:
+            start_ts = parse_epoch_timestamp(start_epoch)
+            query.append("AND epoch_timestamp >= ?")
+            params.append(start_ts)
+
+        if end_epoch:
+            end_ts = parse_epoch_timestamp(end_epoch)
+            query.append("AND epoch_timestamp <= ?")
+            params.append(end_ts)
+
+        query.append(
+            "ORDER BY epoch_timestamp ASC, creation_date_timestamp ASC, id ASC LIMIT ? OFFSET ?"
+        )
+        params.extend([limit, offset])
+
+        sql = " ".join(query)
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                return [HistoricalOrbitalRecord.model_validate(dict(row)) for row in rows]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query historical orbital records for NORAD ID {norad_cat_id}: {exc}"
+            ) from exc
+
+    def count_history_records(self, norad_cat_id: Optional[int] = None) -> int:
+        """Count historical orbital records, optionally filtered by NORAD catalog ID."""
+        conn = self._check_connection()
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                if norad_cat_id is not None:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM orbital_record_history WHERE norad_cat_id = ?",
+                        (norad_cat_id,),
+                    )
+                else:
+                    cur.execute("SELECT COUNT(*) FROM orbital_record_history")
+                return cur.fetchone()[0]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to count historical orbital records: {exc}"
+            ) from exc
+
+    def clear_history(self) -> None:
+        """Clear all historical orbital records (primarily for testing)."""
+        conn = self._check_connection()
+        try:
+            with self._lock, conn:
+                conn.execute("DELETE FROM orbital_record_history")
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Failed to clear historical orbital records: {exc}") from exc
+
+    def save_checkpoint(self, checkpoint: IngestionCheckpoint) -> None:
+        """Insert or update an ingestion progress checkpoint."""
+        conn = self._check_connection()
+
+        earliest_ts = checkpoint.earliest_epoch_timestamp
+        if earliest_ts is None and checkpoint.earliest_epoch:
+            earliest_ts = parse_epoch_timestamp(checkpoint.earliest_epoch)
+
+        latest_ts = checkpoint.latest_epoch_timestamp
+        if latest_ts is None and checkpoint.latest_epoch:
+            latest_ts = parse_epoch_timestamp(checkpoint.latest_epoch)
+
+        params = (
+            checkpoint.norad_cat_id,
+            checkpoint.source,
+            checkpoint.status,
+            checkpoint.earliest_epoch,
+            earliest_ts,
+            checkpoint.latest_epoch,
+            latest_ts,
+            checkpoint.record_count,
+            checkpoint.last_error,
+            checkpoint.last_attempt_at,
+            checkpoint.completed_at,
+        )
+
+        try:
+            with self._lock, conn:
+                cur = conn.cursor()
+                cur.execute(UPSERT_CHECKPOINT_SQL, params)
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to save ingestion checkpoint for NORAD {checkpoint.norad_cat_id} ({checkpoint.source}): {exc}"
+            ) from exc
+
+    def update_checkpoint(self, checkpoint: IngestionCheckpoint) -> None:
+        """Alias for save_checkpoint."""
+        self.save_checkpoint(checkpoint)
+
+    def get_checkpoint(
+        self, norad_cat_id: int, source: str
+    ) -> Optional[IngestionCheckpoint]:
+        """Retrieve ingestion checkpoint by NORAD ID and source."""
+        conn = self._check_connection()
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM ingestion_checkpoints WHERE norad_cat_id = ? AND source = ?",
+                    (norad_cat_id, source),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return IngestionCheckpoint.model_validate(dict(row))
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to retrieve checkpoint for NORAD {norad_cat_id} ({source}): {exc}"
+            ) from exc
+
+    def list_checkpoints(
+        self, source: Optional[str] = None, status: Optional[str] = None
+    ) -> list[IngestionCheckpoint]:
+        """List ingestion checkpoints, optionally filtered by source or status."""
+        conn = self._check_connection()
+        query = ["SELECT * FROM ingestion_checkpoints WHERE 1=1"]
+        params: list[Any] = []
+        if source is not None:
+            query.append("AND source = ?")
+            params.append(source)
+        if status is not None:
+            query.append("AND status = ?")
+            params.append(status)
+        query.append("ORDER BY norad_cat_id ASC, source ASC")
+
+        sql = " ".join(query)
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                return [IngestionCheckpoint.model_validate(dict(row)) for row in rows]
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Failed to list ingestion checkpoints: {exc}") from exc
+
+    def clear_checkpoints(self) -> None:
+        """Clear all ingestion checkpoints (primarily for testing)."""
+        conn = self._check_connection()
+        try:
+            with self._lock, conn:
+                conn.execute("DELETE FROM ingestion_checkpoints")
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Failed to clear ingestion checkpoints: {exc}") from exc
 
     def close(self) -> None:
         """Close SQLite database connection."""

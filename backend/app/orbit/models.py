@@ -276,3 +276,77 @@ class StoredOrbitalRecord(OrbitalRecord):
     def to_orbital_record(self) -> OrbitalRecord:
         """Convert to base OrbitalRecord without persistence metadata."""
         return OrbitalRecord.model_validate(self.model_dump())
+
+
+class HistoricalOrbitalRecord(OrbitalRecord):
+    """Historical orbital element set with full archival metadata and deduplication fingerprint."""
+
+    id: Optional[int] = Field(default=None, description="Internal database surrogate ID")
+    source: str = Field(
+        default="space-track",
+        alias="SOURCE",
+        description="Origin provider (e.g. 'space-track', 'celestrak', 'bulk-zip')",
+    )
+    retrieved_at: Optional[str] = Field(
+        default=None,
+        alias="RETRIEVED_AT",
+        description="UTC timestamp when record was ingested into SatView",
+    )
+    epoch_timestamp: Optional[float] = Field(
+        default=None,
+        alias="EPOCH_TIMESTAMP",
+        description="Numeric Unix timestamp (seconds) of the orbital epoch",
+    )
+    creation_date: Optional[str] = Field(
+        default=None,
+        alias="CREATION_DATE",
+        description="Upstream publication/generation timestamp from space surveillance network",
+    )
+    creation_date_timestamp: Optional[float] = Field(
+        default=None,
+        alias="CREATION_DATE_TIMESTAMP",
+        description="Numeric Unix timestamp (seconds) of creation date",
+    )
+    gp_id: Optional[int] = Field(
+        default=None,
+        alias="GP_ID",
+        description="Space-Track unique record identifier (int10 unsigned)",
+    )
+    fingerprint: Optional[str] = Field(
+        default=None,
+        description="Deterministic SHA-256 fingerprint of canonical orbital and source data",
+    )
+
+    # Optional Space-Track auxiliary metadata
+    semimajor_axis: Optional[float] = Field(default=None, alias="SEMIMAJOR_AXIS")
+    period: Optional[float] = Field(default=None, alias="PERIOD")
+    apoapsis: Optional[float] = Field(default=None, alias="APOAPSIS")
+    periapsis: Optional[float] = Field(default=None, alias="PERIAPSIS")
+    decay_date: Optional[str] = Field(default=None, alias="DECAY_DATE")
+    tle_line1: Optional[str] = Field(default=None, alias="TLE_LINE1")
+    tle_line2: Optional[str] = Field(default=None, alias="TLE_LINE2")
+
+    def to_orbital_record(self) -> OrbitalRecord:
+        """Convert to base OrbitalRecord without historical persistence metadata."""
+        return OrbitalRecord.model_validate(self.model_dump())
+
+
+class IngestionCheckpoint(BaseModel):
+    """Safe checkpoint tracker for local archival ingestion progress and recovery."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    norad_cat_id: int = Field(..., ge=1, le=999999999, description="NORAD Catalog Number")
+    source: str = Field(..., description="Data source identifier (e.g. 'space-track', 'archive-zip')")
+    status: str = Field(
+        default="pending",
+        description="Ingestion status: 'pending', 'in_progress', 'completed', 'failed'",
+    )
+    earliest_epoch: Optional[str] = Field(default=None, description="Earliest ingested epoch (ISO 8601)")
+    earliest_epoch_timestamp: Optional[float] = Field(default=None, description="Unix timestamp of earliest epoch")
+    latest_epoch: Optional[str] = Field(default=None, description="Latest ingested epoch (ISO 8601)")
+    latest_epoch_timestamp: Optional[float] = Field(default=None, description="Unix timestamp of latest epoch")
+    record_count: int = Field(default=0, ge=0, description="Total records imported for this satellite and source")
+    last_error: Optional[str] = Field(default=None, description="Last recorded failure message if any")
+    last_attempt_at: str = Field(..., description="UTC timestamp of last ingestion attempt")
+    completed_at: Optional[str] = Field(default=None, description="UTC timestamp when full ingestion completed")
