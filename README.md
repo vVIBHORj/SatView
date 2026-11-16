@@ -26,6 +26,7 @@ The Orbit Engine (`backend/app/orbit`) provides high-fidelity astrodynamics capa
 - **Task 1.2 — SGP4 Ephemeris Propagation**: GCRS inertial $[X, Y, Z]$ and $[V_X, V_Y, V_Z]$ state vectors computed using SGP4/SDP4 with WGS-72 gravitational model.
 - **Task 1.3 — Topocentric Observer Geometry**: WGS84 observer model computing true geometric azimuth, elevation, slant range, range-rate, and relative vectors without atmospheric distortion.
 - **Task 1.4 & 1.4.1 — Satellite Pass Prediction**: Multi-pass visibility prediction with Brent's method root-finding for exact AOS/LOS boundary refinement, Golden Section culmination search, and culmination-anchored bracketing for near-tangent grazing passes.
+- **Task 1.5 & 1.5.1 — Persistent Orbital Storage & Concurrency Hardening**: SQLite persistence for validated orbital records, distinct storage of epoch vs retrieval time, atomic upserts with stale overwrite protection, WAL mode, thread-safe concurrent access, and offline fallback capability.
 
 ---
 
@@ -61,6 +62,8 @@ uvicorn app.main:app --reload --port 8000
 - Orbit SGP4 Propagation: `http://127.0.0.1:8000/api/orbit/satellite/25544/propagate?time=2026-11-15T05:00:00Z`
 - Orbit Topocentric Observation: `http://127.0.0.1:8000/api/orbit/satellite/25544/observe?lat=28.6139&lon=77.2090&alt_m=216.0`
 - Orbit Pass Prediction: `http://127.0.0.1:8000/api/orbit/satellite/25544/passes?lat=28.6139&lon=77.2090&min_elevation=10.0&days=1.0`
+- Orbit Stored Satellite: `http://127.0.0.1:8000/api/orbit/stored/25544`
+- Orbit List Stored Satellites: `http://127.0.0.1:8000/api/orbit/stored?limit=100`
 - Orbit Group Lookup: `http://127.0.0.1:8000/api/orbit/group/stations`
 
 

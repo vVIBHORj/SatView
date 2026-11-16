@@ -92,6 +92,60 @@ The pass prediction engine identifies when and how a satellite traverses the sky
 
 ---
 
+## Persistent Orbital Data Storage (`OrbitStorage`)
+
+The storage engine persists validated orbital records into a local SQLite database, establishing a reliable offline cache and record repository that survives process restarts.
+
+### Database Schema (`orbital_records`)
+
+| Column Name | SQLite Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `norad_cat_id` | `INTEGER` | `PRIMARY KEY` | NORAD satellite catalog identifier (1 to 999,999,999) |
+| `object_name` | `TEXT` | `NOT NULL` | Standard satellite name (e.g. `ISS (ZARYA)`) |
+| `object_id` | `TEXT` | `NOT NULL` | International COSPAR designator (e.g. `1998-067A`) |
+| `epoch` | `TEXT` | `NOT NULL` | UTC orbital epoch string in ISO 8601 format |
+| `epoch_timestamp` | `REAL` | `NOT NULL` | Numeric Unix epoch timestamp (seconds) for atomic comparisons |
+| `mean_motion` | `REAL` | `NOT NULL` | Mean motion in revolutions per day |
+| `eccentricity` | `REAL` | `NOT NULL` | Orbital eccentricity ($0.0 \le e < 1.0$) |
+| `inclination` | `REAL` | `NOT NULL` | Orbital inclination in degrees ($0.0^\circ \le i \le 180.0^\circ$) |
+| `ra_of_asc_node` | `REAL` | `NOT NULL` | Right Ascension of Ascending Node in degrees |
+| `arg_of_pericenter` | `REAL` | `NOT NULL` | Argument of Pericenter in degrees |
+| `mean_anomaly` | `REAL` | `NOT NULL` | Mean Anomaly in degrees |
+| `ephemeris_type` | `INTEGER` | `DEFAULT 0` | Ephemeris type code (0 = SGP4) |
+| `classification_type` | `TEXT` | `DEFAULT 'U'` | Classification type (`U` = unclassified) |
+| `element_set_no` | `INTEGER` | `NULLABLE` | NORAD element set sequence number |
+| `rev_at_epoch` | `INTEGER` | `NULLABLE` | Revolution number at epoch |
+| `bstar` | `REAL` | `DEFAULT 0.0` | SGP4 aerodynamic drag coefficient ($1 / \text{Earth radii}$) |
+| `mean_motion_dot` | `REAL` | `DEFAULT 0.0` | First time derivative of mean motion |
+| `mean_motion_ddot` | `REAL` | `DEFAULT 0.0` | Second time derivative of mean motion |
+| `source` | `TEXT` | `NOT NULL DEFAULT 'celestrak'` | Provenance source of the element set |
+| `retrieved_at` | `TEXT` | `NOT NULL` | UTC ISO 8601 timestamp of data ingestion |
+
+### Indices
+- `idx_orbital_records_epoch_ts`: Index on `epoch_timestamp` for temporal queries and sorting.
+- `idx_orbital_records_object_name`: Index on `object_name` for fast text searches.
+
+### Data Lifecycle & Stale Overwrite Protection
+1. **Separation of Concerns**: The orbital element epoch (`epoch`), the data retrieval time (`retrieved_at`), and the upstream data provider (`source`) are strictly stored in separate fields.
+2. **Atomic Upsert with Stale Protection**: Record ingestion uses SQLite's atomic upsert syntax:
+   ```sql
+   INSERT INTO orbital_records (...) VALUES (...)
+   ON CONFLICT(norad_cat_id) DO UPDATE SET ...
+   WHERE excluded.epoch_timestamp >= orbital_records.epoch_timestamp;
+   ```
+   - If an incoming record has a newer or identical epoch ($\text{epoch}_{\text{in}} \ge \text{epoch}_{\text{stored}}$), the stored row is updated.
+   - If an incoming record is older ($\text{epoch}_{\text{in}} < \text{epoch}_{\text{stored}}$), the `WHERE` clause prevents overwrite, leaving the newer stored record intact and returning `False` (0 rows modified).
+3. **Storage vs In-Memory Cache**:
+   - `TTLCache`: Fast in-memory cache with a 2-hour TTL matching CelesTrak's publication cadence.
+   - `OrbitStorage`: Persistent SQLite database holding the latest known orbital records across server restarts.
+   - `fallback_to_storage`: `OrbitService.get_satellite_by_catnr(catnr, fallback_to_storage=True)` allows serving the stored record when upstream CelesTrak is unreachable or rate-limited.
+4. **Error Isolation**:
+   - Upstream HTTP failures raise `CelesTrakError`, `CelesTrakRateLimitError` (HTTP 429), or `CelesTrakTimeoutError` (HTTP 504).
+   - Storage failures raise `DatabaseError` (HTTP 500). Database errors never mask upstream errors.
+   - By default (`strict_storage=False`), database write failures log errors without interrupting successful live data responses. With `strict_storage=True`, database failures propagate immediately.
+
+---
+
 ## Caching & Rate Limits
 
 - **CelesTrak Fair-Use Policy**: Request element sets at most once per update cycle (approximately every 2 hours).
@@ -104,6 +158,6 @@ The pass prediction engine identifies when and how a satellite traverses the sky
 1. **Current Orbits Only**: CelesTrak provides current and near-real-time element sets. Historical orbits for past dates require Space-Track (Phase 2).
 2. **Catalog Scope**: Covers public catalog objects only. Classified or unlisted military satellites are omitted.
 3. **Temporal Degradation**: SGP4 is an analytical theory whose accuracy degrades with elapsed time $\Delta t$ from the element set epoch. There is no universal accuracy window: Low Earth Orbit (LEO) satellites experience rapid along-track error accumulation (often several kilometres within 1–2 days or hours during elevated solar activity and atmospheric expansion), whereas high-altitude MEO and GEO satellites with negligible drag retain accuracy over longer periods. Furthermore, active station-keeping maneuvers are unmodeled and immediately invalidate pre-maneuver element sets.
-4. **Visual & Optical Pass Classification**: Satellite illumination conditions (sunlit passes, penumbra, Earth eclipse shadow entry/exit, observer twilight/night conditions) are deferred to Task 1.5.
+4. **Visual & Optical Pass Classification**: Satellite illumination conditions (sunlit passes, penumbra, Earth eclipse shadow entry/exit, observer twilight/night conditions) are deferred to Task 1.6.
 
 

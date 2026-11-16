@@ -56,4 +56,10 @@ class PassPredictionError(OrbitError):
     pass
 
 
+class DatabaseError(OrbitError):
+    """Raised when persistent database storage operations fail."""
+
+    pass
+
+
 

@@ -254,3 +254,25 @@ class OrbitalRecord(BaseModel):
             data["REV_AT_EPOCH"] = 0
 
         return data
+
+
+class StoredOrbitalRecord(OrbitalRecord):
+    """Persistent orbital record with data provenance, storage timestamps, and epoch comparison metadata."""
+
+    source: str = Field(
+        default="celestrak",
+        alias="SOURCE",
+        description="Data source of the orbital elements (e.g. 'celestrak')",
+    )
+    retrieved_at: str = Field(
+        alias="RETRIEVED_AT",
+        description="UTC timestamp when record was retrieved and stored (ISO 8601)",
+    )
+    epoch_timestamp: float = Field(
+        alias="EPOCH_TIMESTAMP",
+        description="Numeric Unix timestamp (seconds) of the orbital epoch for temporal ordering",
+    )
+
+    def to_orbital_record(self) -> OrbitalRecord:
+        """Convert to base OrbitalRecord without persistence metadata."""
+        return OrbitalRecord.model_validate(self.model_dump())

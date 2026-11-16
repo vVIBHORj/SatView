@@ -50,7 +50,13 @@ yarn-error.log*
 *.sqlite
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 satview.db
+satview.db-wal
+satview.db-shm
 
 # OS / Editors
 .DS_Store

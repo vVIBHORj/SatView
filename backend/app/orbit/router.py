@@ -6,6 +6,7 @@ from app.orbit.exceptions import (
     CelesTrakError,
     CelesTrakRateLimitError,
     CelesTrakTimeoutError,
+    DatabaseError,
     ObserverError,
     PassPredictionError,
     PropagationError,
@@ -16,6 +17,7 @@ from app.orbit.models import (
     OrbitalRecord,
     PassPredictionResult,
     PropagationResult,
+    StoredOrbitalRecord,
     TopocentricResult,
 )
 from app.orbit.observer import ObserverService
@@ -68,6 +70,57 @@ async def get_satellite_by_catnr(
     except (CelesTrakError, RecordValidationError) as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        )
+    except DatabaseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        )
+
+
+@router.get(
+    "/stored/{catnr}",
+    response_model=StoredOrbitalRecord,
+    summary="Get persistent stored orbital record for a satellite by NORAD Catalog Number",
+)
+async def get_stored_satellite_by_catnr(
+    catnr: int = Path(
+        ...,
+        ge=1,
+        le=999999999,
+        description="NORAD Catalog Number (1 to 9 digits)",
+        examples=[25544],
+    ),
+) -> Any:
+    try:
+        record = await orbit_service.get_stored_satellite(catnr)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No stored orbital record for NORAD ID {catnr}",
+            )
+        return record
+    except HTTPException:
+        raise
+    except DatabaseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        )
+
+
+@router.get(
+    "/stored",
+    response_model=list[StoredOrbitalRecord],
+    summary="List stored orbital records in persistent database",
+)
+async def list_stored_satellites(
+    limit: int = Query(100, ge=1, le=1000, description="Max records to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+) -> Any:
+    try:
+        return await orbit_service.list_stored_satellites(limit=limit, offset=offset)
+    except DatabaseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
         )
 
 
