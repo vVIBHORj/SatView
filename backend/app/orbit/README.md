@@ -88,7 +88,7 @@ The pass prediction engine identifies when and how a satellite traverses the sky
 * **Rise / Set Crossing Refinement**: Crossing times are solved using **Brent's method** ($f(t) = \text{el}(t) - h_{\text{min}} = 0$) down to a tolerance of $\Delta t \le 10^{-4}\text{ s}$ ($0.1\text{ ms}$), achieving crossing elevation accuracy of $|h(t) - h_{\text{min}}| < 10^{-4\circ}$ ($0.36\text{ arcsec}$).
 * **Culmination & TCA Optimization**: Solved via **Golden Section search** to $\le 10^{-3}\text{ s}$ ($1\text{ ms}$).
 * **Adaptive Scanning Grid**: Evaluated using vectorized Skyfield array operations: $\Delta t = 20\text{ s}$ for LEO ($P < 2\text{ h}$), and $\Delta t \le 60\text{ s}$ for higher orbits.
-* **Grazing Pass Detection**: Crests nearing the threshold ($\ge h_{\text{min}} - 2.5^\circ$) undergo local golden section extrema checks to capture short grazing passes without sampling gaps.
+* **Grazing Pass Detection & Culmination-Anchored Bracketing**: Crests nearing the threshold ($\ge h_{\text{min}} - 2.5^\circ$) undergo local golden section extrema checks to capture short grazing passes without sampling gaps. For near-tangent passes where coarse samples remain below threshold, culmination is solved first and used as an above-threshold anchor to bracket AOS ($[t_{\text{sample}}, t_{\text{culm}}]$) and LOS ($[t_{\text{culm}}, t_{\text{sample}}]$) for Brent's method with guaranteed sign changes.
 
 ---
 

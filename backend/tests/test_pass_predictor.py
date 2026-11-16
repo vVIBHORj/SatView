@@ -497,3 +497,74 @@ def test_api_passes_endpoint_end_before_start():
         )
         assert response.status_code == 400
         assert "strictly after start_time" in response.json()["detail"].lower()
+
+
+def test_near_tangent_grazing_pass_regression_15_847530():
+    """Task 1.4.1 Regression: Verify near-tangent grazing pass root-finding converges with < 1e-4 deg residual."""
+    record = OrbitalRecord.model_validate(MOCK_ISS_OMM)
+    observer = ObserverLocation(latitude=28.6139, longitude=77.2090, elevation_m=216.0)
+    service = PassPredictionService()
+
+    # Pass 4 peaks at 15.856371 deg between coarse samples at 16:07:00 (15.757 deg) and 16:07:20 (15.839 deg).
+    # Coarse samples are both below threshold 15.847530 deg.
+    threshold = 15.847530
+    result = service.predict_passes(
+        record,
+        observer,
+        "2026-11-15T16:02:00Z",
+        "2026-11-15T16:12:00Z",
+        min_elevation_deg=threshold,
+    )
+
+    assert result.pass_count == 1
+    p = result.passes[0]
+
+    # Verify physical ordering: AOS < Culmination < LOS
+    dt_aos = datetime.fromisoformat(p.aos.time)
+    dt_culm = datetime.fromisoformat(p.max_elevation.time)
+    dt_los = datetime.fromisoformat(p.los.time)
+    assert dt_aos < dt_culm < dt_los
+
+    # Verify timestamps lie within the expected coarse interval [16:07:00, 16:07:20]
+    dt_left = datetime(2026, 11, 15, 16, 7, 0, tzinfo=timezone.utc)
+    dt_right = datetime(2026, 11, 15, 16, 7, 20, tzinfo=timezone.utc)
+    assert dt_left <= dt_aos <= dt_right
+    assert dt_left <= dt_los <= dt_right
+
+    # Evaluate exact elevation at refined AOS and LOS
+    ts = load.timescale(builtin=True)
+    sat = EarthSatellite.from_omm(ts, record.to_omm_dict())
+    ground = wgs84.latlon(observer.latitude, observer.longitude, observer.elevation_m)
+    diff = sat - ground
+
+    t_aos_sky = ts.from_datetime(dt_aos)
+    t_los_sky = ts.from_datetime(dt_los)
+
+    alt_aos = diff.at(t_aos_sky).altaz(temperature_C=None)[0].degrees
+    alt_los = diff.at(t_los_sky).altaz(temperature_C=None)[0].degrees
+
+    # Elevation residuals must be strictly below 1e-4 degrees
+    res_aos = abs(alt_aos - threshold)
+    res_los = abs(alt_los - threshold)
+    assert res_aos < 1e-4, f"AOS elevation residual {res_aos} exceeded 1e-4 deg"
+    assert res_los < 1e-4, f"LOS elevation residual {res_los} exceeded 1e-4 deg"
+
+
+def test_near_tangent_peak_just_below_threshold_rejected():
+    """Task 1.4.1 Regression: Verify peak just below threshold (15.86 deg > 15.856 deg) is rejected."""
+    record = OrbitalRecord.model_validate(MOCK_ISS_OMM)
+    observer = ObserverLocation(latitude=28.6139, longitude=77.2090, elevation_m=216.0)
+    service = PassPredictionService()
+
+    # Peak is at 15.856371 deg; threshold 15.860000 deg is just above the peak
+    result = service.predict_passes(
+        record,
+        observer,
+        "2026-11-15T16:02:00Z",
+        "2026-11-15T16:12:00Z",
+        min_elevation_deg=15.860000,
+    )
+
+    assert result.pass_count == 0
+    assert result.passes == []
+

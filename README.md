@@ -14,8 +14,18 @@ SatView is designed to answer two distinct questions for any specified location 
 - **Frontend**: React 18 + Vite
 - **Database**: SQLite (`satview.db`)
 - **AI Explainer**: Local Ollama (`qwen3:4b` primary model)
-- **Orbit Engine** *(future phase)*: Skyfield + SGP4
+- **Orbit Engine**: Skyfield + SGP4 / SDP4 (CelesTrak OMM, GCRS propagation, topocentric observer coordinates, pass prediction)
 - **Imagery Integrations** *(future phase)*: STAC API / Copernicus / Microsoft Planetary Computer
+
+---
+
+## Phase 1: Orbit Engine
+
+The Orbit Engine (`backend/app/orbit`) provides high-fidelity astrodynamics capabilities:
+- **Task 1.1 — CelesTrak OMM Adapter**: Real-time retrieval, schema validation, and TTL caching for CCSDS OMM JSON orbital data.
+- **Task 1.2 — SGP4 Ephemeris Propagation**: GCRS inertial $[X, Y, Z]$ and $[V_X, V_Y, V_Z]$ state vectors computed using SGP4/SDP4 with WGS-72 gravitational model.
+- **Task 1.3 — Topocentric Observer Geometry**: WGS84 observer model computing true geometric azimuth, elevation, slant range, range-rate, and relative vectors without atmospheric distortion.
+- **Task 1.4 & 1.4.1 — Satellite Pass Prediction**: Multi-pass visibility prediction with Brent's method root-finding for exact AOS/LOS boundary refinement, Golden Section culmination search, and culmination-anchored bracketing for near-tangent grazing passes.
 
 ---
 

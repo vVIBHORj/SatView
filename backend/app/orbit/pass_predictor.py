@@ -238,54 +238,113 @@ class PassPredictionService:
     ) -> Optional[SatellitePass]:
         """Refine a coarse candidate interval into an accurate SatellitePass using root finding."""
 
-        # 1. Refine AOS (Rise time)
-        truncated_start = False
-        if start_i == 0 and coarse_alts[0] >= min_elevation_deg:
-            s_aos = 0.0
-            truncated_start = True
-        else:
-            # Bracket crossing: coarse_alts[start_i - 1] < min_elevation_deg <= coarse_alts[start_i]
-            bracket_a = sec_arr[max(0, start_i - 1)]
-            bracket_b = sec_arr[start_i]
-            s_aos = self._brent_root(
-                lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
-                bracket_a,
-                bracket_b,
-                tol=1e-4,
-            )
-
-        # 2. Refine LOS (Set time)
-        truncated_end = False
-        if end_i == len(coarse_alts) - 1 and coarse_alts[-1] >= min_elevation_deg:
-            s_los = window_duration_s
-            truncated_end = True
-        else:
-            # Bracket crossing: coarse_alts[end_i - 1] >= min_elevation_deg > coarse_alts[end_i]
-            bracket_c = sec_arr[max(0, end_i - 1)]
-            bracket_d = sec_arr[end_i]
-            s_los = self._brent_root(
-                lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
-                bracket_c,
-                bracket_d,
-                tol=1e-4,
-            )
-
-        if s_los <= s_aos:
-            return None
-
-        # 3. Find Maximum Elevation (Culmination)
+        # 1. Refine Culmination (Maximum Elevation) first to establish the above-threshold point
+        s_search_a = sec_arr[max(0, start_i - 1)] if start_i > 0 else 0.0
+        s_search_b = sec_arr[end_i] if end_i < len(sec_arr) else window_duration_s
         s_culm = self._golden_section_opt(
             lambda s: self._eval_alt(diff_obj, dt_start, s),
-            s_aos,
-            s_los,
+            s_search_a,
+            s_search_b,
             maximize=True,
             tol=1e-3,
         )
         alt_culm, az_culm, dist_culm = self._eval_all(diff_obj, dt_start, s_culm)
 
-        # Discard if maximum elevation did not genuinely reach the threshold
+        # Discard candidate if true maximum elevation does not reach threshold
         if alt_culm < min_elevation_deg:
             return None
+
+        f_culm = alt_culm - min_elevation_deg
+
+        # 2. Refine AOS (Rise time)
+        truncated_start = False
+        if start_i == 0 and coarse_alts[0] >= min_elevation_deg:
+            s_aos = 0.0
+            truncated_start = True
+        else:
+            bracket_a = sec_arr[max(0, start_i - 1)]
+            bracket_b = sec_arr[start_i]
+            fa = self._eval_alt(diff_obj, dt_start, bracket_a) - min_elevation_deg
+            fb = self._eval_alt(diff_obj, dt_start, bracket_b) - min_elevation_deg
+
+            # Check if standard coarse bracket spans the crossing
+            if fa * fb <= 0:
+                s_aos = self._brent_root(
+                    lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
+                    bracket_a,
+                    bracket_b,
+                    tol=1e-4,
+                )
+            # Grazing crest case: coarse samples below threshold, bracket with culmination
+            elif fa < 0 and f_culm >= 0:
+                s_aos = self._brent_root(
+                    lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
+                    bracket_a,
+                    s_culm,
+                    tol=1e-4,
+                )
+            elif fb < 0 and f_culm >= 0:
+                s_aos = self._brent_root(
+                    lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
+                    bracket_b,
+                    s_culm,
+                    tol=1e-4,
+                )
+            else:
+                return None
+
+        # 3. Refine LOS (Set time)
+        truncated_end = False
+        if end_i == len(coarse_alts) - 1 and coarse_alts[-1] >= min_elevation_deg:
+            s_los = window_duration_s
+            truncated_end = True
+        else:
+            bracket_c = sec_arr[max(0, end_i - 1)]
+            bracket_d = sec_arr[end_i]
+            fc = self._eval_alt(diff_obj, dt_start, bracket_c) - min_elevation_deg
+            fd = self._eval_alt(diff_obj, dt_start, bracket_d) - min_elevation_deg
+
+            # Check if standard coarse bracket spans the crossing
+            if fc * fd <= 0:
+                s_los = self._brent_root(
+                    lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
+                    bracket_c,
+                    bracket_d,
+                    tol=1e-4,
+                )
+            # Grazing crest case: coarse samples below threshold, bracket with culmination
+            elif f_culm >= 0 and fd < 0:
+                s_los = self._brent_root(
+                    lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
+                    s_culm,
+                    bracket_d,
+                    tol=1e-4,
+                )
+            elif f_culm >= 0 and fc < 0:
+                s_los = self._brent_root(
+                    lambda s: self._eval_alt(diff_obj, dt_start, s) - min_elevation_deg,
+                    s_culm,
+                    bracket_c,
+                    tol=1e-4,
+                )
+            else:
+                return None
+
+        if s_los <= s_aos:
+            return None
+
+        # Ensure culmination lies strictly within [s_aos, s_los]
+        if not (s_aos <= s_culm <= s_los):
+            s_culm = self._golden_section_opt(
+                lambda s: self._eval_alt(diff_obj, dt_start, s),
+                s_aos,
+                s_los,
+                maximize=True,
+                tol=1e-3,
+            )
+            alt_culm, az_culm, dist_culm = self._eval_all(diff_obj, dt_start, s_culm)
+            if alt_culm < min_elevation_deg:
+                return None
 
         # 4. Find Time of Closest Approach (TCA / Minimum Slant Range)
         # Note: In eccentric orbits, TCA does NOT always coincide with maximum elevation
@@ -430,8 +489,8 @@ class PassPredictionService:
         """Brent's method for finding root of f(x) = 0 in bracket [a, b]."""
         fa, fb = f(a), f(b)
         if fa * fb > 0:
-            # If not bracketed due to numerical jitter, return endpoint closer to zero
-            return a if abs(fa) < abs(fb) else b
+            raise ValueError(f"Root is not bracketed in [{a}, {b}]: f({a})={fa}, f({b})={fb}")
+
 
         if abs(fa) < abs(fb):
             a, b = b, a
