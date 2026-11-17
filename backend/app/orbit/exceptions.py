@@ -62,4 +62,22 @@ class DatabaseError(OrbitError):
     pass
 
 
+class ArchiveError(OrbitError):
+    """Base exception for historical archive parsing and ingestion errors."""
+
+    pass
+
+
+class ArchiveFormatError(ArchiveError):
+    """Raised when an archive format is unsupported, malformed, or empty."""
+
+    pass
+
+
+class ArchiveSecurityError(ArchiveError):
+    """Raised when an archive contains unsafe paths (e.g. path traversal or absolute paths)."""
+
+    pass
+
+
 

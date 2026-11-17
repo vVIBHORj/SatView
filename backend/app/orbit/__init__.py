@@ -1,8 +1,17 @@
 """Orbit engine package for SatView."""
 
+from app.orbit.archive import (
+    ArchiveParseError,
+    HistoricalArchiveIngestor,
+    HistoricalArchiveReader,
+    IngestionResult,
+)
 from app.orbit.cache import TTLCache
 from app.orbit.celestrak import CelesTrakClient
 from app.orbit.exceptions import (
+    ArchiveError,
+    ArchiveFormatError,
+    ArchiveSecurityError,
     CelesTrakError,
     CelesTrakRateLimitError,
     CelesTrakTimeoutError,
@@ -68,6 +77,13 @@ __all__ = [
     "PropagationError",
     "ObserverError",
     "PassPredictionError",
+    "ArchiveError",
+    "ArchiveFormatError",
+    "ArchiveSecurityError",
+    "ArchiveParseError",
+    "IngestionResult",
+    "HistoricalArchiveReader",
+    "HistoricalArchiveIngestor",
     "compute_record_fingerprint",
     "parse_epoch_timestamp",
 ]

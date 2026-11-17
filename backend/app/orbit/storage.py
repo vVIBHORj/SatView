@@ -801,19 +801,25 @@ class OrbitStorage:
                 f"Failed to query historical orbital records for NORAD ID {norad_cat_id}: {exc}"
             ) from exc
 
-    def count_history_records(self, norad_cat_id: Optional[int] = None) -> int:
-        """Count historical orbital records, optionally filtered by NORAD catalog ID."""
+    def count_history_records(
+        self,
+        norad_cat_id: Optional[int] = None,
+        source: Optional[str] = None,
+    ) -> int:
+        """Count historical orbital records, optionally filtered by NORAD catalog ID and/or source."""
         conn = self._check_connection()
+        query = ["SELECT COUNT(*) FROM orbital_record_history WHERE 1=1"]
+        params: list[Any] = []
+        if norad_cat_id is not None:
+            query.append("AND norad_cat_id = ?")
+            params.append(norad_cat_id)
+        if source is not None:
+            query.append("AND source = ?")
+            params.append(source)
         try:
             with self._lock:
                 cur = conn.cursor()
-                if norad_cat_id is not None:
-                    cur.execute(
-                        "SELECT COUNT(*) FROM orbital_record_history WHERE norad_cat_id = ?",
-                        (norad_cat_id,),
-                    )
-                else:
-                    cur.execute("SELECT COUNT(*) FROM orbital_record_history")
+                cur.execute(" ".join(query), params)
                 return cur.fetchone()[0]
         except sqlite3.Error as exc:
             raise DatabaseError(
