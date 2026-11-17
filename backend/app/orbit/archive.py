@@ -54,7 +54,7 @@ class IngestionResult(BaseModel):
 
 
 def compute_file_sha256(path: Path) -> str:
-    """Compute deterministic SHA-256 hex digest of a local archive file."""
+    """Compute deterministic full SHA-256 hex digest (64 chars) of a local archive file in chunks."""
     hasher = hashlib.sha256()
     with open(path, "rb") as f:
         while chunk := f.read(65536):
@@ -63,7 +63,12 @@ def compute_file_sha256(path: Path) -> str:
 
 
 def validate_zip_entry_safety(filename: str) -> None:
-    """Validate that a zip entry path does not attempt path traversal or absolute file escaping."""
+    """Validate that a zip entry path does not attempt path traversal or absolute file escaping.
+
+    Normalizes both forward slashes and backslashes before inspecting path components
+    to ensure consistent security on all operating systems (Windows, Linux, macOS)
+    while preserving legitimate nested archive directory structures.
+    """
     if not filename:
         raise ArchiveSecurityError("Empty zip entry filename.")
     if "\0" in filename:
@@ -72,7 +77,11 @@ def validate_zip_entry_safety(filename: str) -> None:
         raise ArchiveSecurityError(f"Zip entry has unsafe absolute path: '{filename}'")
     if len(filename) >= 2 and filename[1] == ":":
         raise ArchiveSecurityError(f"Zip entry has unsafe Windows drive path: '{filename}'")
+
     norm_filename = filename.replace("\\", "/")
+    if norm_filename.startswith("/"):
+        raise ArchiveSecurityError(f"Zip entry has unsafe absolute path: '{filename}'")
+
     parts = Path(norm_filename).parts
     if ".." in parts:
         raise ArchiveSecurityError(f"Zip entry attempts path traversal ('..'): '{filename}'")
@@ -121,11 +130,25 @@ def clean_record_dict(raw: dict[str, Any], default_source: str = "space-track") 
 
 
 class HistoricalArchiveReader:
-    """Reader for local Space-Track GP_HISTORY JSON, CSV, and ZIP archives."""
+    """Reader for local Space-Track GP_HISTORY JSON, CSV, and ZIP archives.
+
+    Resource Limits:
+        MAX_ZIP_MEMBERS (int): Maximum number of entries allowed inside a ZIP archive (default: 10,000).
+        MAX_UNCOMPRESSED_ENTRY_BYTES (int): Maximum uncompressed size allowed for any single entry (default: 250 MB).
+        MAX_CUMULATIVE_UNCOMPRESSED_BYTES (int): Maximum cumulative uncompressed size across all entries in a ZIP (default: 1 GB).
+        MAX_JSON_BUFFER_BYTES (int): Maximum in-memory buffer allowed for parsing JSON arrays or single objects (default: 250 MB).
+
+    Security Notice:
+        Declared uncompressed sizes in ZIP headers are evaluated before opening streams as preliminary
+        safeguards against decompression bombs. Note that declared ZIP header sizes are preliminary
+        defensive checks and do not substitute for in-memory stream boundaries.
+    """
 
     SUPPORTED_EXTENSIONS = {".json", ".csv", ".zip"}
     MAX_ZIP_MEMBERS: int = 10_000
     MAX_UNCOMPRESSED_ENTRY_BYTES: int = 250 * 1024 * 1024  # 250 MB
+    MAX_CUMULATIVE_UNCOMPRESSED_BYTES: int = 1024 * 1024 * 1024  # 1 GB
+    MAX_JSON_BUFFER_BYTES: int = 250 * 1024 * 1024  # 250 MB
 
     def iter_archive(
         self, archive_path: Path | str, default_source: str = "space-track"
@@ -197,11 +220,25 @@ class HistoricalArchiveReader:
     def _iter_json_stream(
         self, text_stream: io.TextIOBase, entry_name: str, default_source: str
     ) -> Generator[tuple[Optional[HistoricalOrbitalRecord], Optional[ArchiveParseError]], None, None]:
-        content = text_stream.read().strip()
-        if not content:
-            return
+        # Peek first non-whitespace character to determine JSON format without full buffering
+        first_char = ""
+        while True:
+            ch = text_stream.read(1)
+            if not ch:
+                return
+            if not ch.isspace():
+                first_char = ch
+                break
 
-        if content.startswith("["):
+        if first_char == "[":
+            # JSON array format: read stream up to MAX_JSON_BUFFER_BYTES limit
+            remaining = text_stream.read(self.MAX_JSON_BUFFER_BYTES + 1)
+            if len(remaining) > self.MAX_JSON_BUFFER_BYTES:
+                raise ArchiveSecurityError(
+                    f"JSON array entry '{entry_name}' exceeds maximum buffer limit "
+                    f"of {self.MAX_JSON_BUFFER_BYTES} bytes."
+                )
+            content = first_char + remaining
             try:
                 data = json.loads(content)
             except Exception as exc:
@@ -243,42 +280,85 @@ class HistoricalArchiveReader:
                         error_message=str(exc),
                     )
         else:
-            # Try single object first
+            # First line: check if it's a single-line JSON object (NDJSON or compact object)
+            rest_of_line = text_stream.readline()
+            first_line = (first_char + rest_of_line).strip()
+            is_ndjson = False
+            first_item = None
             try:
-                single_obj = json.loads(content)
-                if isinstance(single_obj, dict):
-                    cleaned = clean_record_dict(single_obj, default_source=default_source)
+                first_item = json.loads(first_line)
+                if isinstance(first_item, dict):
+                    is_ndjson = True
+            except json.JSONDecodeError:
+                is_ndjson = False
+
+            if is_ndjson and first_item is not None:
+                # Process first row
+                try:
+                    cleaned = clean_record_dict(first_item, default_source=default_source)
                     record = HistoricalOrbitalRecord.model_validate(cleaned)
                     yield record, None
-                    return
-            except json.JSONDecodeError:
-                pass
+                except (ValidationError, RecordValidationError, ValueError, TypeError, KeyError) as exc:
+                    yield None, ArchiveParseError(
+                        entry_name=entry_name,
+                        row_number=1,
+                        raw_record=first_item,
+                        error_message=str(exc),
+                    )
 
-            # Parse line by line (NDJSON)
-            lines = content.splitlines()
-            for row_idx, line in enumerate(lines, start=1):
-                line_str = line.strip()
-                if not line_str:
-                    continue
-                try:
-                    item = json.loads(line_str)
-                    if not isinstance(item, dict):
+                # Stream remaining rows line-by-line without loading entire file into memory
+                for row_idx, line in enumerate(text_stream, start=2):
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    try:
+                        item = json.loads(line_str)
+                        if not isinstance(item, dict):
+                            yield None, ArchiveParseError(
+                                entry_name=entry_name,
+                                row_number=row_idx,
+                                raw_record={"line": line_str},
+                                error_message="Line must be a JSON object",
+                            )
+                            continue
+                        cleaned = clean_record_dict(item, default_source=default_source)
+                        record = HistoricalOrbitalRecord.model_validate(cleaned)
+                        yield record, None
+                    except Exception as exc:
                         yield None, ArchiveParseError(
                             entry_name=entry_name,
                             row_number=row_idx,
                             raw_record={"line": line_str},
-                            error_message="Line must be a JSON object",
+                            error_message=str(exc),
                         )
-                        continue
-                    cleaned = clean_record_dict(item, default_source=default_source)
-                    record = HistoricalOrbitalRecord.model_validate(cleaned)
-                    yield record, None
+            else:
+                # Multi-line pretty-printed single JSON object: read up to buffer limit
+                remaining = text_stream.read(self.MAX_JSON_BUFFER_BYTES + 1)
+                if len(remaining) > self.MAX_JSON_BUFFER_BYTES:
+                    raise ArchiveSecurityError(
+                        f"JSON entry '{entry_name}' exceeds maximum buffer limit "
+                        f"of {self.MAX_JSON_BUFFER_BYTES} bytes."
+                    )
+                content = first_line + "\n" + remaining
+                try:
+                    obj = json.loads(content)
+                    if isinstance(obj, dict):
+                        cleaned = clean_record_dict(obj, default_source=default_source)
+                        record = HistoricalOrbitalRecord.model_validate(cleaned)
+                        yield record, None
+                    else:
+                        yield None, ArchiveParseError(
+                            entry_name=entry_name,
+                            row_number=1,
+                            raw_record=obj if isinstance(obj, dict) else {"raw": str(obj)},
+                            error_message="JSON content must be a JSON object or array",
+                        )
                 except Exception as exc:
                     yield None, ArchiveParseError(
                         entry_name=entry_name,
-                        row_number=row_idx,
-                        raw_record={"line": line_str},
-                        error_message=str(exc),
+                        row_number=None,
+                        raw_record=None,
+                        error_message=f"JSON decode error: {exc}",
                     )
 
     def _iter_zip(
@@ -296,7 +376,8 @@ class HistoricalArchiveReader:
                         f"({len(infolist)} > {self.MAX_ZIP_MEMBERS})."
                     )
 
-                supported_count = 0
+                # Preliminary safeguard: check declared uncompressed sizes before processing
+                cumulative_uncompressed_bytes = 0
                 for info in infolist:
                     validate_zip_entry_safety(info.filename)
                     if info.is_dir():
@@ -307,6 +388,17 @@ class HistoricalArchiveReader:
                             f"ZIP entry '{info.filename}' exceeds uncompressed size limit "
                             f"({info.file_size} > {self.MAX_UNCOMPRESSED_ENTRY_BYTES} bytes)."
                         )
+                    cumulative_uncompressed_bytes += info.file_size
+                    if cumulative_uncompressed_bytes > self.MAX_CUMULATIVE_UNCOMPRESSED_BYTES:
+                        raise ArchiveSecurityError(
+                            f"ZIP archive '{archive_path.name}' exceeds cumulative uncompressed size limit "
+                            f"({cumulative_uncompressed_bytes} > {self.MAX_CUMULATIVE_UNCOMPRESSED_BYTES} bytes)."
+                        )
+
+                supported_count = 0
+                for info in infolist:
+                    if info.is_dir():
+                        continue
 
                     lower_name = info.filename.lower()
                     if lower_name.endswith(".csv"):
@@ -351,9 +443,11 @@ class HistoricalArchiveIngestor:
             raise FileNotFoundError(f"Archive file not found: {path}")
 
         if source and source.strip():
+            # Caller-provided explicit source override (caller is responsible for source uniqueness)
             qualified_source = source.strip()
         else:
-            file_hash = compute_file_sha256(path)[:12]
+            # Deterministic archive identity based on stem and full SHA-256 digest of contents
+            file_hash = compute_file_sha256(path)
             qualified_source = f"space-track:gp-history:{path.stem.lower()}:{file_hash}"
 
         result = IngestionResult(

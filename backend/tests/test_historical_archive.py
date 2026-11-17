@@ -542,13 +542,18 @@ def test_ingestion_isolates_from_latest_records(
 def test_ingest_archive_epoch_bounds_fractional_seconds_correctly_ordered(
     ingestor: HistoricalArchiveIngestor, memory_storage: OrbitStorage
 ) -> None:
-    """Checkpoint epoch bounds are ordered by numeric timestamp, not lexicographical string comparison."""
-    # Note: '2023-01-01T00:00:00.500000Z' is lexicographically SMALLER than '2023-01-01T00:00:00Z'
-    # due to '.' (46) < 'Z' (90), but chronologically LATER.
+    """Checkpoint epoch bounds are ordered by numeric timestamp, not lexicographical string comparison.
+
+    Covers:
+    - Fractional-second vs whole-second where whole-second is chronologically earlier.
+    - Multiple fractional-second timestamps within the exact same second.
+    """
     source_id = "space-track:bounds-microsecond-test"
     records_data = [
         make_raw_dict(norad_cat_id=25544, gp_id=8001, epoch="2023-01-01T00:00:00Z"),
         make_raw_dict(norad_cat_id=25544, gp_id=8002, epoch="2023-01-01T00:00:00.500000Z"),
+        make_raw_dict(norad_cat_id=25544, gp_id=8003, epoch="2023-01-01T00:00:00.100000Z"),
+        make_raw_dict(norad_cat_id=25544, gp_id=8004, epoch="2023-01-01T00:00:00.999999Z"),
     ]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
         json.dump(records_data, f)
@@ -561,10 +566,12 @@ def test_ingest_archive_epoch_bounds_fractional_seconds_correctly_ordered(
         cp = memory_storage.get_checkpoint(25544, source_id)
         assert cp is not None
         assert cp.earliest_epoch == "2023-01-01T00:00:00Z"
-        assert cp.latest_epoch == "2023-01-01T00:00:00.500000Z"
+        assert cp.latest_epoch == "2023-01-01T00:00:00.999999Z"
         assert cp.earliest_epoch_timestamp is not None
         assert cp.latest_epoch_timestamp is not None
         assert cp.earliest_epoch_timestamp < cp.latest_epoch_timestamp
+        assert cp.earliest_epoch_timestamp == parse_epoch_timestamp("2023-01-01T00:00:00Z")
+        assert cp.latest_epoch_timestamp == parse_epoch_timestamp("2023-01-01T00:00:00.999999Z")
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -572,7 +579,7 @@ def test_ingest_archive_epoch_bounds_fractional_seconds_correctly_ordered(
 def test_default_archive_source_disambiguates_different_files_with_same_stem(
     ingestor: HistoricalArchiveIngestor, memory_storage: OrbitStorage
 ) -> None:
-    """Two different archives with the same filename stem receive distinct qualified sources via content digest."""
+    """Two different archives with the same filename stem receive distinct qualified sources via full SHA-256 digest."""
     with tempfile.TemporaryDirectory() as dir1, tempfile.TemporaryDirectory() as dir2:
         path1 = Path(dir1) / "gp_history.json"
         path2 = Path(dir2) / "gp_history.json"
@@ -593,11 +600,65 @@ def test_default_archive_source_disambiguates_different_files_with_same_stem(
         assert res1.source.startswith("space-track:gp-history:gp_history:")
         assert res2.source.startswith("space-track:gp-history:gp_history:")
 
+        # Full SHA-256 digest is 64 hex characters
+        digest1 = res1.source.split(":")[-1]
+        digest2 = res2.source.split(":")[-1]
+        assert len(digest1) == 64
+        assert len(digest2) == 64
+        assert digest1 != digest2
+
         # Both checkpoints exist independently
         cp1 = memory_storage.get_checkpoint(25544, res1.source)
         cp2 = memory_storage.get_checkpoint(25544, res2.source)
         assert cp1 is not None and cp1.earliest_epoch == "2022-01-01T00:00:00Z"
         assert cp2 is not None and cp2.earliest_epoch == "2023-01-01T00:00:00Z"
+
+
+def test_archive_identity_same_contents_different_paths_produce_same_source(
+    ingestor: HistoricalArchiveIngestor, memory_storage: OrbitStorage
+) -> None:
+    """Identical archive contents at different paths yield identical source identities and reuse checkpoints."""
+    with tempfile.TemporaryDirectory() as dir1, tempfile.TemporaryDirectory() as dir2:
+        path1 = Path(dir1) / "archive.json"
+        path2 = Path(dir2) / "archive.json"
+
+        records = [make_raw_dict(norad_cat_id=25544, gp_id=9101, epoch="2023-01-01T00:00:00Z")]
+        content = json.dumps(records)
+        path1.write_text(content, encoding="utf-8")
+        path2.write_text(content, encoding="utf-8")
+
+        res1 = ingestor.ingest_archive(path1)
+        res2 = ingestor.ingest_archive(path2)
+
+        # Source identities are identical
+        assert res1.source == res2.source
+
+        # Second import deduplicates against first
+        assert res1.total_inserted == 1
+        assert res2.total_inserted == 0
+        assert res2.total_skipped == 1
+
+
+def test_archive_identity_changed_contents_under_same_filename(
+    ingestor: HistoricalArchiveIngestor, memory_storage: OrbitStorage
+) -> None:
+    """Changed archive contents under the exact same filename get distinct source identities."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive_path = Path(tmpdir) / "export.json"
+
+        # Version 1: 1 record
+        records_v1 = [make_raw_dict(norad_cat_id=25544, gp_id=9201, epoch="2023-01-01T00:00:00Z")]
+        archive_path.write_text(json.dumps(records_v1), encoding="utf-8")
+        res1 = ingestor.ingest_archive(archive_path)
+
+        # Version 2: Modified contents (different GP_ID and epoch)
+        records_v2 = [make_raw_dict(norad_cat_id=25544, gp_id=9202, epoch="2023-01-02T00:00:00Z")]
+        archive_path.write_text(json.dumps(records_v2), encoding="utf-8")
+        res2 = ingestor.ingest_archive(archive_path)
+
+        assert res1.source != res2.source
+        assert memory_storage.get_checkpoint(25544, res1.source) is not None
+        assert memory_storage.get_checkpoint(25544, res2.source) is not None
 
 
 def test_zip_safety_backslash_path_traversal_rejected(reader: HistoricalArchiveReader) -> None:
@@ -611,15 +672,108 @@ def test_zip_safety_backslash_path_traversal_rejected(reader: HistoricalArchiveR
             reader.parse_archive(zip_path)
 
 
-def test_zip_oversized_uncompressed_entry_rejected(memory_storage: OrbitStorage) -> None:
-    """ZIP entries exceeding uncompressed entry size limits raise ArchiveSecurityError."""
+def test_zip_safety_nested_directories_preserved(reader: HistoricalArchiveReader) -> None:
+    """Legitimate nested directories inside ZIP archives are accepted and parsed safely."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = Path(tmpdir) / "nested_valid.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            csv_buf = io.StringIO()
+            w = csv.DictWriter(
+                csv_buf,
+                fieldnames=[
+                    "NORAD_CAT_ID", "OBJECT_NAME", "OBJECT_ID", "EPOCH",
+                    "MEAN_MOTION", "ECCENTRICITY", "INCLINATION", "RA_OF_ASC_NODE",
+                    "ARG_OF_PERICENTER", "MEAN_ANOMALY", "GP_ID",
+                ],
+            )
+            w.writeheader()
+            w.writerow({
+                "NORAD_CAT_ID": 25544, "OBJECT_NAME": "ISS", "OBJECT_ID": "1998-067A",
+                "EPOCH": "2023-01-01T00:00:00Z", "MEAN_MOTION": 15.5, "ECCENTRICITY": 0.0001,
+                "INCLINATION": 51.64, "RA_OF_ASC_NODE": 120.0, "ARG_OF_PERICENTER": 60.0,
+                "MEAN_ANOMALY": 30.0, "GP_ID": 9301,
+            })
+            zf.writestr("legitimate/nested/subfolder/iss.csv", csv_buf.getvalue())
+
+        recs, errs = reader.parse_archive(zip_path)
+        assert len(errs) == 0
+        assert len(recs) == 1
+        assert recs[0].gp_id == 9301
+
+
+def test_zip_resource_limits_member_count_and_cumulative_size() -> None:
+    """ZIP processing enforces declared member count, per-entry size, and cumulative uncompressed size limits."""
     custom_reader = HistoricalArchiveReader()
-    custom_reader.MAX_UNCOMPRESSED_ENTRY_BYTES = 100  # Artificially low limit for testing
+    custom_reader.MAX_ZIP_MEMBERS = 2
+    custom_reader.MAX_UNCOMPRESSED_ENTRY_BYTES = 500
+    custom_reader.MAX_CUMULATIVE_UNCOMPRESSED_BYTES = 800
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = Path(tmpdir) / "large_entry.zip"
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            zf.writestr("data.csv", "x" * 200)
+        # 1. Exceed member count limit
+        zip_members = Path(tmpdir) / "too_many_members.zip"
+        with zipfile.ZipFile(zip_members, "w") as zf:
+            zf.writestr("file1.csv", "a")
+            zf.writestr("file2.csv", "b")
+            zf.writestr("file3.csv", "c")
+
+        with pytest.raises(ArchiveSecurityError, match="exceeds maximum member limit"):
+            custom_reader.parse_archive(zip_members)
+
+        # 2. Exceed per-entry uncompressed size limit
+        custom_reader.MAX_ZIP_MEMBERS = 10
+        zip_entry = Path(tmpdir) / "too_large_entry.zip"
+        with zipfile.ZipFile(zip_entry, "w") as zf:
+            zf.writestr("data.csv", "x" * 600)
 
         with pytest.raises(ArchiveSecurityError, match="exceeds uncompressed size limit"):
-            custom_reader.parse_archive(zip_path)
+            custom_reader.parse_archive(zip_entry)
+
+        # 3. Exceed cumulative uncompressed size limit
+        zip_cumulative = Path(tmpdir) / "too_large_cumulative.zip"
+        with zipfile.ZipFile(zip_cumulative, "w") as zf:
+            zf.writestr("file1.csv", "x" * 450)
+            zf.writestr("file2.csv", "x" * 450)
+
+        with pytest.raises(ArchiveSecurityError, match="exceeds cumulative uncompressed size limit"):
+            custom_reader.parse_archive(zip_cumulative)
+
+
+def test_ndjson_line_by_line_streaming_and_isolated_errors(reader: HistoricalArchiveReader) -> None:
+    """NDJSON parsing streams line-by-line; an invalid line yields an error without dropping subsequent lines."""
+    valid_row1 = json.dumps(make_raw_dict(norad_cat_id=25544, gp_id=9401, epoch="2023-01-01T00:00:00Z"))
+    invalid_row2 = "{\"NORAD_CAT_ID\": \"INVALID\", \"EPOCH\": \"BAD\"}"
+    valid_row3 = json.dumps(make_raw_dict(norad_cat_id=25544, gp_id=9402, epoch="2023-01-02T00:00:00Z"))
+
+    content = f"{valid_row1}\n{invalid_row2}\n{valid_row3}\n"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        f.write(content)
+        temp_path = Path(f.name)
+
+    try:
+        recs, errs = reader.parse_archive(temp_path)
+        assert len(recs) == 2
+        assert len(errs) == 1
+        assert errs[0].row_number == 2
+        assert {r.gp_id for r in recs} == {9401, 9402}
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def test_json_array_buffer_limit_enforced() -> None:
+    """JSON array parsing rejects inputs exceeding MAX_JSON_BUFFER_BYTES with ArchiveSecurityError."""
+    custom_reader = HistoricalArchiveReader()
+    custom_reader.MAX_JSON_BUFFER_BYTES = 50  # Artificially low limit for testing
+
+    records = [
+        make_raw_dict(norad_cat_id=25544, gp_id=9501, epoch="2023-01-01T00:00:00Z"),
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(records, f)
+        temp_path = Path(f.name)
+
+    try:
+        with pytest.raises(ArchiveSecurityError, match="exceeds maximum buffer limit"):
+            custom_reader.parse_archive(temp_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
