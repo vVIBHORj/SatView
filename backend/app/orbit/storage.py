@@ -356,6 +356,22 @@ ON CONFLICT(norad_cat_id, source) DO UPDATE SET
 """
 
 
+def history_record_tie_key(record: HistoricalOrbitalRecord) -> tuple[int, float, int, int]:
+    """Sort key for deterministic historical orbital record tie-breaking.
+
+    Tie-breaking hierarchy:
+    1. Prefer non-null creation date over missing creation date (1 vs 0).
+    2. Latest creation date timestamp.
+    3. Highest GP_ID (Space-Track catalog entry).
+    4. Highest surrogate database ID.
+    """
+    has_cd = 1 if record.creation_date_timestamp is not None else 0
+    cd_ts = record.creation_date_timestamp if record.creation_date_timestamp is not None else -1.0
+    gp = record.gp_id if record.gp_id is not None else -1
+    rec_id = record.id if record.id is not None else -1
+    return (has_cd, cd_ts, gp, rec_id)
+
+
 class OrbitStorage:
     """Thread-safe persistent SQLite storage for validated satellite orbital records."""
 
@@ -810,20 +826,72 @@ class OrbitStorage:
         target_timestamp: float,
         limit: int = 20,
     ) -> list[HistoricalOrbitalRecord]:
-        """Query closest prior historical records for a satellite ordered by epoch DESC, creation_date DESC, gp_id DESC, id DESC."""
+        """Query closest prior historical records for a satellite using an index-backed multi-stage query.
+
+        Ordering requirements:
+        1. Closest prior epoch first (epoch_timestamp DESC).
+        2. Equal epochs: latest non-null creation date first.
+        3. Equal creation dates: highest GP_ID.
+        4. Equal GP_IDs: highest database surrogate ID.
+
+        Multi-stage execution strategy:
+        Stage 1: Probe the closest prior epoch using the covering index
+                 idx_history_norad_epoch (norad_cat_id, epoch_timestamp, creation_date_timestamp)
+                 with LIMIT 1 (zero temp B-tree, pure index lookup).
+        Stage 2: Fetch all candidate records matching that exact closest epoch, ordered
+                 by creation_date_timestamp DESC, id DESC (pure index slice, zero temp B-tree).
+                 Resolve same-epoch GP_ID and database ID ties in Python using history_record_tie_key.
+        Stage 3: If candidate limit > len(tied_records), fetch earlier prior records
+                 (epoch_timestamp < closest_epoch_ts) ordered by epoch_timestamp DESC,
+                 creation_date_timestamp DESC, id DESC with LIMIT remaining (pure index reverse scan).
+
+        This eliminates temporary B-tree sorting in SQLite while strictly guaranteeing
+        that the SQL LIMIT never excludes the true tie-break winner.
+        """
         conn = self._check_connection()
-        sql = (
-            "SELECT * FROM orbital_record_history "
-            "WHERE norad_cat_id = ? AND epoch_timestamp <= ? "
-            "ORDER BY epoch_timestamp DESC, creation_date_timestamp DESC, gp_id DESC, id DESC "
-            "LIMIT ?"
-        )
         try:
             with self._lock:
                 cur = conn.cursor()
-                cur.execute(sql, (norad_cat_id, target_timestamp, limit))
-                rows = cur.fetchall()
-                return [HistoricalOrbitalRecord.model_validate(dict(row)) for row in rows]
+                # Stage 1: Find closest prior epoch
+                cur.execute(
+                    "SELECT epoch_timestamp FROM orbital_record_history "
+                    "WHERE norad_cat_id = ? AND epoch_timestamp <= ? "
+                    "ORDER BY epoch_timestamp DESC, creation_date_timestamp DESC, id DESC "
+                    "LIMIT 1",
+                    (norad_cat_id, target_timestamp),
+                )
+                first_row = cur.fetchone()
+                if not first_row:
+                    return []
+                closest_epoch_ts = first_row["epoch_timestamp"]
+
+                # Stage 2: Fetch all records at that exact closest epoch
+                cur.execute(
+                    "SELECT * FROM orbital_record_history "
+                    "WHERE norad_cat_id = ? AND epoch_timestamp = ? "
+                    "ORDER BY creation_date_timestamp DESC, id DESC",
+                    (norad_cat_id, closest_epoch_ts),
+                )
+                tied_rows = cur.fetchall()
+                tied_records = [HistoricalOrbitalRecord.model_validate(dict(r)) for r in tied_rows]
+                tied_records.sort(key=history_record_tie_key, reverse=True)
+
+                candidates = tied_records[:limit]
+                if len(candidates) < limit:
+                    remaining = limit - len(candidates)
+                    cur.execute(
+                        "SELECT * FROM orbital_record_history "
+                        "WHERE norad_cat_id = ? AND epoch_timestamp < ? "
+                        "ORDER BY epoch_timestamp DESC, creation_date_timestamp DESC, id DESC "
+                        "LIMIT ?",
+                        (norad_cat_id, closest_epoch_ts, remaining),
+                    )
+                    earlier_rows = cur.fetchall()
+                    candidates.extend(
+                        [HistoricalOrbitalRecord.model_validate(dict(r)) for r in earlier_rows]
+                    )
+
+                return candidates
         except sqlite3.Error as exc:
             raise DatabaseError(
                 f"Failed to query prior historical candidates for NORAD ID {norad_cat_id}: {exc}"
@@ -835,20 +903,72 @@ class OrbitStorage:
         target_timestamp: float,
         limit: int = 5,
     ) -> list[HistoricalOrbitalRecord]:
-        """Query closest subsequent historical records for a satellite ordered by epoch ASC, creation_date DESC, gp_id DESC, id DESC."""
+        """Query closest subsequent historical records for a satellite using an index-backed multi-stage query.
+
+        Ordering requirements:
+        1. Closest subsequent epoch first (epoch_timestamp ASC).
+        2. Equal epochs: latest non-null creation date first.
+        3. Equal creation dates: highest GP_ID.
+        4. Equal GP_IDs: highest database surrogate ID.
+
+        Multi-stage execution strategy:
+        Stage 1: Probe the closest subsequent epoch using the covering index
+                 idx_history_norad_epoch (norad_cat_id, epoch_timestamp, creation_date_timestamp)
+                 with LIMIT 1 (zero temp B-tree, pure index lookup).
+        Stage 2: Fetch all candidate records matching that exact closest subsequent epoch,
+                 ordered by creation_date_timestamp DESC, id DESC (pure index slice, zero temp B-tree).
+                 Resolve same-epoch GP_ID and database ID ties in Python using history_record_tie_key.
+        Stage 3: If candidate limit > len(tied_records), fetch further subsequent records
+                 (epoch_timestamp > closest_sub_epoch_ts) ordered by epoch_timestamp ASC,
+                 creation_date_timestamp ASC, id ASC with LIMIT remaining (pure index forward scan).
+
+        This eliminates temporary B-tree sorting in SQLite while maintaining deterministic
+        subsequent candidate tie-breaking.
+        """
         conn = self._check_connection()
-        sql = (
-            "SELECT * FROM orbital_record_history "
-            "WHERE norad_cat_id = ? AND epoch_timestamp > ? "
-            "ORDER BY epoch_timestamp ASC, creation_date_timestamp DESC, gp_id DESC, id DESC "
-            "LIMIT ?"
-        )
         try:
             with self._lock:
                 cur = conn.cursor()
-                cur.execute(sql, (norad_cat_id, target_timestamp, limit))
-                rows = cur.fetchall()
-                return [HistoricalOrbitalRecord.model_validate(dict(row)) for row in rows]
+                # Stage 1: Find closest subsequent epoch
+                cur.execute(
+                    "SELECT epoch_timestamp FROM orbital_record_history "
+                    "WHERE norad_cat_id = ? AND epoch_timestamp > ? "
+                    "ORDER BY epoch_timestamp ASC, creation_date_timestamp ASC, id ASC "
+                    "LIMIT 1",
+                    (norad_cat_id, target_timestamp),
+                )
+                first_row = cur.fetchone()
+                if not first_row:
+                    return []
+                closest_sub_epoch_ts = first_row["epoch_timestamp"]
+
+                # Stage 2: Fetch all records at that exact closest subsequent epoch
+                cur.execute(
+                    "SELECT * FROM orbital_record_history "
+                    "WHERE norad_cat_id = ? AND epoch_timestamp = ? "
+                    "ORDER BY creation_date_timestamp DESC, id DESC",
+                    (norad_cat_id, closest_sub_epoch_ts),
+                )
+                tied_rows = cur.fetchall()
+                tied_records = [HistoricalOrbitalRecord.model_validate(dict(r)) for r in tied_rows]
+                tied_records.sort(key=history_record_tie_key, reverse=True)
+
+                candidates = tied_records[:limit]
+                if len(candidates) < limit:
+                    remaining = limit - len(candidates)
+                    cur.execute(
+                        "SELECT * FROM orbital_record_history "
+                        "WHERE norad_cat_id = ? AND epoch_timestamp > ? "
+                        "ORDER BY epoch_timestamp ASC, creation_date_timestamp ASC, id ASC "
+                        "LIMIT ?",
+                        (norad_cat_id, closest_sub_epoch_ts, remaining),
+                    )
+                    further_rows = cur.fetchall()
+                    candidates.extend(
+                        [HistoricalOrbitalRecord.model_validate(dict(r)) for r in further_rows]
+                    )
+
+                return candidates
         except sqlite3.Error as exc:
             raise DatabaseError(
                 f"Failed to query subsequent historical candidates for NORAD ID {norad_cat_id}: {exc}"

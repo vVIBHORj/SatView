@@ -55,6 +55,7 @@ from app.orbit.service import OrbitService
 from app.orbit.storage import (
     OrbitStorage,
     compute_record_fingerprint,
+    history_record_tie_key,
     parse_epoch_timestamp,
 )
 
@@ -108,6 +109,7 @@ __all__ = [
     "HistoricalSelectionError",
     "HistoricalRecordNotFoundError",
     "compute_record_fingerprint",
+    "history_record_tie_key",
     "parse_epoch_timestamp",
 ]
 

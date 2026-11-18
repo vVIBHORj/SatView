@@ -622,3 +622,180 @@ def test_request_threshold_overrides_inversion_validation() -> None:
             nominal_threshold_hours=100.0,
             max_epoch_distance_hours=50.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# 9. Task 1.6.3.2 Query Optimization & Candidate Window Tests
+# ---------------------------------------------------------------------------
+
+
+def test_creation_date_ties_and_null_creation_dates(
+    service: HistoricalSelectionService, memory_storage: OrbitStorage
+) -> None:
+    """Rigorous tie-breaking hierarchy: non-null beats null, newer creation_date beats older, gp_id breaks date ties, id breaks gp_id ties."""
+    epoch = "2023-06-01T00:00:00Z"
+
+    # 1. Non-null creation date vs null creation date: non-null creation date wins even if null has higher gp_id
+    rec_null = make_rec(epoch=epoch, creation_date=None, gp_id=999999)
+    rec_date = make_rec(epoch=epoch, creation_date="2023-06-01T01:00:00Z", gp_id=100)
+    memory_storage.batch_insert_history([rec_null, rec_date])
+
+    res1 = service.select_record(25544, "2023-06-01T02:00:00Z")
+    assert res1.record is not None
+    assert res1.gp_id == 100
+    assert res1.creation_date == "2023-06-01T01:00:00Z"
+
+    # 2. Identical creation dates: higher gp_id wins
+    rec_date_higher_gp = make_rec(epoch=epoch, creation_date="2023-06-01T01:00:00Z", gp_id=200)
+    memory_storage.insert_history_record(rec_date_higher_gp)
+
+    res2 = service.select_record(25544, "2023-06-01T02:00:00Z")
+    assert res2.record is not None
+    assert res2.gp_id == 200
+
+    # 3. Newer creation date beats older creation date regardless of gp_id
+    rec_newer_date = make_rec(epoch=epoch, creation_date="2023-06-01T03:00:00Z", gp_id=10)
+    memory_storage.insert_history_record(rec_newer_date)
+
+    res3 = service.select_record(25544, "2023-06-01T04:00:00Z")
+    assert res3.record is not None
+    assert res3.creation_date == "2023-06-01T03:00:00Z"
+    assert res3.gp_id == 10
+
+
+def test_candidate_window_behavior_prior_and_subsequent(memory_storage: OrbitStorage) -> None:
+    """Storage candidate queries respect candidate window limits and fill earlier/further epochs cleanly."""
+    norad_id = 30001
+    target_ts = 1685620800.0  # 2023-06-01T12:00:00Z
+
+    # Insert 5 records at closest prior epoch (2023-06-01T10:00:00Z)
+    closest_epoch = "2023-06-01T10:00:00Z"
+    for i in range(1, 6):
+        memory_storage.insert_history_record(
+            make_rec(
+                norad_cat_id=norad_id,
+                epoch=closest_epoch,
+                gp_id=100 + i,
+                creation_date=f"2023-06-01T10:{i:02d}:00Z",
+            )
+        )
+
+    # Insert 10 records across earlier epochs (1h, 2h, ... 10h prior)
+    for i in range(1, 11):
+        memory_storage.insert_history_record(
+            make_rec(
+                norad_cat_id=norad_id,
+                epoch=f"2023-05-31T{i:02d}:00:00Z",
+                gp_id=200 + i,
+            )
+        )
+
+    # Window limit = 3: should return only the top 3 from closest epoch
+    priors_3 = memory_storage.find_prior_history_candidates(norad_id, target_ts, limit=3)
+    assert len(priors_3) == 3
+    assert all(p.epoch == closest_epoch for p in priors_3)
+    assert priors_3[0].gp_id == 105  # Highest creation date (10:05:00Z)
+
+    # Window limit = 8: should return all 5 from closest epoch + 3 earlier records
+    priors_8 = memory_storage.find_prior_history_candidates(norad_id, target_ts, limit=8)
+    assert len(priors_8) == 8
+    # Top 5 must be from closest epoch, sorted by creation date
+    assert all(p.epoch == closest_epoch for p in priors_8[:5])
+    assert priors_8[0].gp_id == 105
+    # Next 3 must be earlier epochs sorted by epoch DESC
+    assert priors_8[5].epoch_timestamp < priors_8[4].epoch_timestamp
+    assert priors_8[6].epoch_timestamp <= priors_8[5].epoch_timestamp
+
+    # Window limit = 25 (exceeds total 15 available): returns all 15 records
+    priors_all = memory_storage.find_prior_history_candidates(norad_id, target_ts, limit=25)
+    assert len(priors_all) == 15
+
+    # Subsequent candidate window testing
+    sub_epoch1 = "2023-06-01T14:00:00Z"
+    sub_epoch2 = "2023-06-01T18:00:00Z"
+    for i in range(1, 4):
+        memory_storage.insert_history_record(
+            make_rec(
+                norad_cat_id=norad_id,
+                epoch=sub_epoch1,
+                gp_id=300 + i,
+                creation_date=f"2023-06-01T14:{i:02d}:00Z",
+            )
+        )
+    for i in range(1, 4):
+        memory_storage.insert_history_record(
+            make_rec(
+                norad_cat_id=norad_id,
+                epoch=sub_epoch2,
+                gp_id=400 + i,
+            )
+        )
+
+    subs_2 = memory_storage.find_subsequent_history_candidates(norad_id, target_ts, limit=2)
+    assert len(subs_2) == 2
+    assert all(s.epoch == sub_epoch1 for s in subs_2)
+    assert subs_2[0].gp_id == 303  # Highest creation date at closest future epoch
+
+    subs_5 = memory_storage.find_subsequent_history_candidates(norad_id, target_ts, limit=5)
+    assert len(subs_5) == 5
+    # First 3 are sub_epoch1, next 2 are sub_epoch2
+    assert all(s.epoch == sub_epoch1 for s in subs_5[:3])
+    assert all(s.epoch == sub_epoch2 for s in subs_5[3:])
+
+
+def test_large_same_epoch_tie_group_preserves_winner_under_limit(
+    service: HistoricalSelectionService, memory_storage: OrbitStorage
+) -> None:
+    """Large tie group (80 records) at the same epoch preserves the complete winner even when exceeding limit."""
+    norad_id = 30002
+    epoch = "2023-06-01T00:00:00Z"
+
+    # Insert 80 records:
+    # 79 records have NULL creation dates and moderate GP_IDs
+    # Record 1 has latest creation date and highest GP_ID
+    recs = []
+    for i in range(1, 81):
+        recs.append(
+            make_rec(
+                norad_cat_id=norad_id,
+                epoch=epoch,
+                gp_id=999999 if i == 1 else 1000 + i,
+                creation_date="2023-06-01T08:00:00Z" if i == 1 else None,
+                mean_motion=15.5,
+            )
+        )
+    memory_storage.batch_insert_history(recs)
+
+    # Selection service default prior limit is 50; total tied records is 80
+    res = service.select_record(norad_id, "2023-06-01T01:00:00Z")
+    assert res.record is not None
+    assert res.gp_id == 999999
+    assert res.creation_date == "2023-06-01T08:00:00Z"
+
+
+def test_deterministic_replays_multi_stage_queries(
+    service: HistoricalSelectionService, memory_storage: OrbitStorage
+) -> None:
+    """100 repeated selection queries on multi-stage query architecture yield bit-for-bit identical results."""
+    norad_id = 30003
+    recs = [
+        make_rec(
+            norad_cat_id=norad_id,
+            epoch=f"2023-06-01T{i:02d}:00:00Z",
+            gp_id=5000 + i,
+            creation_date=f"2023-06-01T{i:02d}:30:00Z",
+        )
+        for i in range(12)
+    ]
+    memory_storage.batch_insert_history(recs)
+
+    baseline = service.select_record(norad_id, "2023-06-01T06:15:00Z")
+
+    for _ in range(100):
+        replayed = service.select_record(norad_id, "2023-06-01T06:15:00Z")
+        assert replayed.gp_id == baseline.gp_id
+        assert replayed.element_epoch == baseline.element_epoch
+        assert replayed.time_difference_seconds == baseline.time_difference_seconds
+        assert replayed.quality == baseline.quality
+        assert replayed.metadata.candidates_evaluated == baseline.metadata.candidates_evaluated
+
