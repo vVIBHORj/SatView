@@ -16,6 +16,8 @@ from app.orbit.exceptions import (
     CelesTrakRateLimitError,
     CelesTrakTimeoutError,
     DatabaseError,
+    HistoricalRecordNotFoundError,
+    HistoricalSelectionError,
     ObserverError,
     OrbitError,
     PassPredictionError,
@@ -24,15 +26,22 @@ from app.orbit.exceptions import (
     SatelliteNotFoundError,
 )
 from app.orbit.models import (
+    CandidateContext,
     ClosestApproachPoint,
     HistoricalOrbitalRecord,
+    HistoricalSelectionRequest,
+    HistoricalSelectionResult,
     IngestionCheckpoint,
     ObserverLocation,
     OrbitalRecord,
     PassPoint,
     PassPredictionResult,
     PropagationResult,
+    RegimeThresholds,
     SatellitePass,
+    SelectionMetadata,
+    SelectionPolicyConfig,
+    SelectionQuality,
     StoredOrbitalRecord,
     TopocentricResult,
     Vector3D,
@@ -40,6 +49,7 @@ from app.orbit.models import (
 from app.orbit.observer import ObserverService
 from app.orbit.pass_predictor import PassPredictionService
 from app.orbit.propagator import OrbitPropagator
+from app.orbit.selection import HistoricalSelectionService, classify_orbital_regime
 from app.orbit.service import OrbitService
 from app.orbit.storage import (
     OrbitStorage,
@@ -84,6 +94,17 @@ __all__ = [
     "IngestionResult",
     "HistoricalArchiveReader",
     "HistoricalArchiveIngestor",
+    "HistoricalSelectionService",
+    "classify_orbital_regime",
+    "HistoricalSelectionRequest",
+    "HistoricalSelectionResult",
+    "SelectionMetadata",
+    "CandidateContext",
+    "SelectionPolicyConfig",
+    "RegimeThresholds",
+    "SelectionQuality",
+    "HistoricalSelectionError",
+    "HistoricalRecordNotFoundError",
     "compute_record_fingerprint",
     "parse_epoch_timestamp",
 ]

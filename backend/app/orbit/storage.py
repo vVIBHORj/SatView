@@ -756,6 +756,7 @@ class OrbitStorage:
         end_epoch: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
+        order_desc: bool = False,
     ) -> list[HistoricalOrbitalRecord]:
         """Query historical orbital records for a satellite ordered chronologically.
 
@@ -765,10 +766,11 @@ class OrbitStorage:
             end_epoch: Optional end of range (inclusive ISO 8601 UTC timestamp).
             limit: Maximum number of records to return (default: 100).
             offset: Pagination offset (default: 0).
+            order_desc: If True, order DESC (newest epoch first); otherwise ASC (default: False).
 
         Returns:
-            List of HistoricalOrbitalRecord ordered by epoch_timestamp ASC,
-            creation_date_timestamp ASC, id ASC.
+            List of HistoricalOrbitalRecord ordered by epoch_timestamp,
+            creation_date_timestamp, id.
         """
         conn = self._check_connection()
         query = ["SELECT * FROM orbital_record_history WHERE norad_cat_id = ?"]
@@ -784,8 +786,9 @@ class OrbitStorage:
             query.append("AND epoch_timestamp <= ?")
             params.append(end_ts)
 
+        order_dir = "DESC" if order_desc else "ASC"
         query.append(
-            "ORDER BY epoch_timestamp ASC, creation_date_timestamp ASC, id ASC LIMIT ? OFFSET ?"
+            f"ORDER BY epoch_timestamp {order_dir}, creation_date_timestamp {order_dir}, id {order_dir} LIMIT ? OFFSET ?"
         )
         params.extend([limit, offset])
 
@@ -799,6 +802,56 @@ class OrbitStorage:
         except sqlite3.Error as exc:
             raise DatabaseError(
                 f"Failed to query historical orbital records for NORAD ID {norad_cat_id}: {exc}"
+            ) from exc
+
+    def find_prior_history_candidates(
+        self,
+        norad_cat_id: int,
+        target_timestamp: float,
+        limit: int = 20,
+    ) -> list[HistoricalOrbitalRecord]:
+        """Query closest prior historical records for a satellite ordered by epoch DESC, creation_date DESC, id DESC."""
+        conn = self._check_connection()
+        sql = (
+            "SELECT * FROM orbital_record_history "
+            "WHERE norad_cat_id = ? AND epoch_timestamp <= ? "
+            "ORDER BY epoch_timestamp DESC, creation_date_timestamp DESC, id DESC "
+            "LIMIT ?"
+        )
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                cur.execute(sql, (norad_cat_id, target_timestamp, limit))
+                rows = cur.fetchall()
+                return [HistoricalOrbitalRecord.model_validate(dict(row)) for row in rows]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query prior historical candidates for NORAD ID {norad_cat_id}: {exc}"
+            ) from exc
+
+    def find_subsequent_history_candidates(
+        self,
+        norad_cat_id: int,
+        target_timestamp: float,
+        limit: int = 5,
+    ) -> list[HistoricalOrbitalRecord]:
+        """Query closest subsequent historical records for a satellite ordered by epoch ASC, creation_date ASC, id ASC."""
+        conn = self._check_connection()
+        sql = (
+            "SELECT * FROM orbital_record_history "
+            "WHERE norad_cat_id = ? AND epoch_timestamp > ? "
+            "ORDER BY epoch_timestamp ASC, creation_date_timestamp ASC, id ASC "
+            "LIMIT ?"
+        )
+        try:
+            with self._lock:
+                cur = conn.cursor()
+                cur.execute(sql, (norad_cat_id, target_timestamp, limit))
+                rows = cur.fetchall()
+                return [HistoricalOrbitalRecord.model_validate(dict(row)) for row in rows]
+        except sqlite3.Error as exc:
+            raise DatabaseError(
+                f"Failed to query subsequent historical candidates for NORAD ID {norad_cat_id}: {exc}"
             ) from exc
 
     def count_history_records(

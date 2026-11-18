@@ -80,4 +80,17 @@ class ArchiveSecurityError(ArchiveError):
     pass
 
 
+class HistoricalSelectionError(OrbitError):
+    """Base exception for historical orbital element selection errors."""
+
+    pass
+
+
+class HistoricalRecordNotFoundError(HistoricalSelectionError):
+    """Raised when no historical orbital records exist matching selection criteria."""
+
+    pass
+
+
+
 

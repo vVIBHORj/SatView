@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -350,3 +350,125 @@ class IngestionCheckpoint(BaseModel):
     last_error: Optional[str] = Field(default=None, description="Last recorded failure message if any")
     last_attempt_at: str = Field(..., description="UTC timestamp of last ingestion attempt")
     completed_at: Optional[str] = Field(default=None, description="UTC timestamp when full ingestion completed")
+
+
+SelectionQuality = Literal["nominal", "degraded", "unreliable", "unavailable"]
+
+
+class RegimeThresholds(BaseModel):
+    """Configurable operational staleness thresholds for an orbital regime."""
+
+    nominal_hours: float = Field(..., gt=0, description="Nominal epoch distance threshold in hours")
+    max_hours: float = Field(..., gt=0, description="Maximum operational epoch distance threshold in hours")
+
+
+class SelectionPolicyConfig(BaseModel):
+    """Configuration for historical orbital record selection policy."""
+
+    policy_name: str = Field(default="conservative_prior", description="Identifier of the selection policy")
+    leo_thresholds: RegimeThresholds = Field(
+        default_factory=lambda: RegimeThresholds(nominal_hours=24.0, max_hours=72.0),
+        description="Thresholds for Low Earth Orbit (period < 128 min, mean motion > 11.25)",
+    )
+    meo_thresholds: RegimeThresholds = Field(
+        default_factory=lambda: RegimeThresholds(nominal_hours=168.0, max_hours=336.0),
+        description="Thresholds for Medium Earth Orbit (default: 7 days nominal, 14 days max)",
+    )
+    geo_thresholds: RegimeThresholds = Field(
+        default_factory=lambda: RegimeThresholds(nominal_hours=168.0, max_hours=336.0),
+        description="Thresholds for Geostationary/Geosynchronous Orbit (default: 7 days nominal, 14 days max)",
+    )
+    default_thresholds: RegimeThresholds = Field(
+        default_factory=lambda: RegimeThresholds(nominal_hours=24.0, max_hours=72.0),
+        description="Default fallback thresholds when orbital regime is unclassified",
+    )
+
+
+class CandidateContext(BaseModel):
+    """Metadata summary of an evaluated or alternative candidate element set."""
+
+    record_id: Optional[int] = Field(default=None, description="Database surrogate ID")
+    gp_id: Optional[int] = Field(default=None, description="Space-Track GP_ID")
+    epoch: str = Field(..., description="Element epoch ISO 8601 UTC string")
+    epoch_timestamp: float = Field(..., description="Numeric Unix timestamp of element epoch")
+    creation_date: Optional[str] = Field(default=None, description="Creation timestamp if available")
+    creation_date_timestamp: Optional[float] = Field(default=None, description="Creation Unix timestamp")
+    source: str = Field(..., description="Record origin source identifier")
+    time_difference_seconds: float = Field(
+        ...,
+        description="Signed time difference: requested_timestamp - epoch_timestamp (positive: prior, negative: subsequent)",
+    )
+    absolute_distance_hours: float = Field(..., description="Absolute distance between requested time and epoch in hours")
+    is_prior: bool = Field(..., description="True if candidate epoch is at or before requested time")
+
+
+class SelectionMetadata(BaseModel):
+    """Auditing and diagnostic metadata describing selection execution and candidate context."""
+
+    policy_name: str = Field(..., description="Selection policy applied")
+    orbital_regime: str = Field(..., description="Detected or configured orbital regime (e.g. LEO, MEO, GEO, OTHER)")
+    nominal_threshold_hours: float = Field(..., description="Nominal staleness threshold applied (hours)")
+    max_threshold_hours: float = Field(..., description="Maximum operational staleness threshold applied (hours)")
+    allow_unreliable_requested: bool = Field(..., description="Whether allow_unreliable flag was enabled")
+    candidates_evaluated: int = Field(default=0, ge=0, description="Total number of candidates examined")
+    subsequent_candidate: Optional[CandidateContext] = Field(
+        default=None, description="Closest subsequent candidate retained as context"
+    )
+    alternative_prior_candidates_count: int = Field(
+        default=0, ge=0, description="Count of additional prior candidates available"
+    )
+
+
+class HistoricalSelectionRequest(BaseModel):
+    """Request parameters for historical orbital element selection."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    norad_cat_id: int = Field(..., ge=1, le=999999999, description="NORAD Catalog Number")
+    timestamp: str = Field(..., description="Requested UTC timestamp in ISO 8601 format")
+    allow_unreliable: bool = Field(
+        default=False,
+        description="If True, return an otherwise stale prior record outside operational max with quality='unreliable'",
+    )
+    max_epoch_distance_hours: Optional[float] = Field(
+        default=None, gt=0, description="Optional override for maximum acceptable epoch distance in hours"
+    )
+    nominal_threshold_hours: Optional[float] = Field(
+        default=None, gt=0, description="Optional override for nominal threshold in hours"
+    )
+    orbital_regime: Optional[str] = Field(
+        default=None, description="Optional explicit regime override ('LEO', 'MEO', 'GEO', 'OTHER')"
+    )
+
+
+class HistoricalSelectionResult(BaseModel):
+    """Result of historical orbital record selection including provenance, time difference, and quality."""
+
+    norad_cat_id: int = Field(..., description="NORAD Catalog Number")
+    requested_time: str = Field(..., description="Normalized requested UTC timestamp (ISO 8601)")
+    requested_timestamp: float = Field(..., description="Unix timestamp of requested time")
+    quality: str = Field(
+        ...,
+        description="Quality classification: 'nominal', 'degraded', 'unreliable', or 'unavailable'",
+    )
+    reason: str = Field(..., description="Explanatory description of the selection outcome")
+    record: Optional[HistoricalOrbitalRecord] = Field(
+        default=None, description="The selected HistoricalOrbitalRecord (None if unavailable)"
+    )
+    record_id: Optional[int] = Field(default=None, description="Database surrogate ID of selected record")
+    gp_id: Optional[int] = Field(default=None, description="Space-Track GP_ID of selected record")
+    element_epoch: Optional[str] = Field(default=None, description="Epoch timestamp of selected element set")
+    creation_date: Optional[str] = Field(default=None, description="Creation timestamp of selected element set")
+    source: Optional[str] = Field(default=None, description="Source provenance of selected element set")
+    time_difference_seconds: Optional[float] = Field(
+        default=None,
+        description="Signed time difference: requested_timestamp - element_epoch_timestamp (positive: prior, negative: subsequent)",
+    )
+    absolute_distance_hours: Optional[float] = Field(
+        default=None, description="Absolute epoch distance in hours"
+    )
+    is_prior: Optional[bool] = Field(
+        default=None, description="True if selected record epoch is <= requested timestamp"
+    )
+    metadata: SelectionMetadata = Field(..., description="Detailed selection metadata and context")
+
