@@ -810,12 +810,12 @@ class OrbitStorage:
         target_timestamp: float,
         limit: int = 20,
     ) -> list[HistoricalOrbitalRecord]:
-        """Query closest prior historical records for a satellite ordered by epoch DESC, creation_date DESC, id DESC."""
+        """Query closest prior historical records for a satellite ordered by epoch DESC, creation_date DESC, gp_id DESC, id DESC."""
         conn = self._check_connection()
         sql = (
             "SELECT * FROM orbital_record_history "
             "WHERE norad_cat_id = ? AND epoch_timestamp <= ? "
-            "ORDER BY epoch_timestamp DESC, creation_date_timestamp DESC, id DESC "
+            "ORDER BY epoch_timestamp DESC, creation_date_timestamp DESC, gp_id DESC, id DESC "
             "LIMIT ?"
         )
         try:
@@ -835,12 +835,12 @@ class OrbitStorage:
         target_timestamp: float,
         limit: int = 5,
     ) -> list[HistoricalOrbitalRecord]:
-        """Query closest subsequent historical records for a satellite ordered by epoch ASC, creation_date ASC, id ASC."""
+        """Query closest subsequent historical records for a satellite ordered by epoch ASC, creation_date DESC, gp_id DESC, id DESC."""
         conn = self._check_connection()
         sql = (
             "SELECT * FROM orbital_record_history "
             "WHERE norad_cat_id = ? AND epoch_timestamp > ? "
-            "ORDER BY epoch_timestamp ASC, creation_date_timestamp ASC, id ASC "
+            "ORDER BY epoch_timestamp ASC, creation_date_timestamp DESC, gp_id DESC, id DESC "
             "LIMIT ?"
         )
         try:

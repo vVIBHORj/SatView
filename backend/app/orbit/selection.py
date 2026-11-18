@@ -16,6 +16,7 @@ from app.orbit.models import (
     HistoricalSelectionRequest,
     HistoricalSelectionResult,
     OrbitalRecord,
+    OrbitalRegimeType,
     SelectionMetadata,
     SelectionPolicyConfig,
 )
@@ -30,11 +31,16 @@ def classify_orbital_regime(record: OrbitalRecord) -> str:
     Operational classification rules:
     - LEO (Low Earth Orbit): mean_motion > 11.25 rev/day (period < ~128 min, altitude < ~2,000 km)
     - GEO (Geostationary/Geosynchronous): 0.95 <= mean_motion <= 1.05 rev/day and eccentricity < 0.2
-    - MEO (Medium Earth Orbit): 1.05 < mean_motion <= 11.25 rev/day (e.g. GPS, Galileo, Glonass)
-    - OTHER: all other configurations (e.g. highly elliptical orbits, deep space, sub-orbital)
+    - MEO (Medium Earth Orbit): 1.05 < mean_motion <= 11.25 rev/day and eccentricity < 0.25 (e.g. GPS, Galileo, Glonass)
+    - OTHER: all other configurations (e.g. highly elliptical orbits such as Molniya/GTO, high-eccentricity
+      geosynchronous orbits like Tundra, deep space, sub-orbital, unclassified)
 
-    Note: This is an operational heuristic for selecting staleness thresholds,
-    not a strict astrodynamical boundary.
+    Note:
+        This heuristic is an operational classification designed specifically to select appropriate
+        staleness thresholds; it is not claimed to be a complete or rigorous astrodynamical taxonomy.
+        High-eccentricity objects in the MEO band (such as Molniya orbits with e ~ 0.74) are routed
+        to OTHER to avoid applying overly permissive circular MEO thresholds (e.g. 7-day nominal)
+        to orbits experiencing significant perigee atmospheric drag.
     """
     mm = record.mean_motion
     ecc = record.eccentricity
@@ -43,7 +49,7 @@ def classify_orbital_regime(record: OrbitalRecord) -> str:
         return "LEO"
     if 0.95 <= mm <= 1.05 and ecc < 0.2:
         return "GEO"
-    if 1.05 < mm <= 11.25:
+    if 1.05 < mm <= 11.25 and ecc < 0.25:
         return "MEO"
     return "OTHER"
 
@@ -273,7 +279,7 @@ class HistoricalSelectionService:
         allow_unreliable: bool = False,
         max_epoch_distance_hours: Optional[float] = None,
         nominal_threshold_hours: Optional[float] = None,
-        orbital_regime: Optional[str] = None,
+        orbital_regime: Optional[OrbitalRegimeType] = None,
     ) -> HistoricalSelectionResult:
         """Convenience method accepting raw arguments for historical orbital record selection."""
         if isinstance(timestamp, datetime):
@@ -295,6 +301,12 @@ class HistoricalSelectionService:
         return self.select(req)
 
     def _get_thresholds_for_regime(self, regime: str):
+        """Map orbital regime identifier to applicable operational thresholds.
+
+        Regimes classified as OTHER or unclassified map to default_thresholds
+        (24-hour nominal / 72-hour maximum). This represents an operational conservative
+        fallback, not a scientific or astrodynamical guarantee.
+        """
         if regime == "LEO":
             return self.config.leo_thresholds
         if regime == "GEO":

@@ -1,6 +1,7 @@
 """Comprehensive tests for historical orbital record selection service."""
 
 from datetime import datetime, timezone
+from pydantic import ValidationError
 import pytest
 
 from app.orbit.exceptions import RecordValidationError
@@ -469,3 +470,155 @@ def test_request_regime_and_threshold_overrides(
     assert res.quality == "degraded"
     assert res.metadata.nominal_threshold_hours == 2.0
     assert res.metadata.max_threshold_hours == 5.0
+
+
+# ---------------------------------------------------------------------------
+# 8. Task 1.6.3.1 Policy Hardening Tests
+# ---------------------------------------------------------------------------
+
+
+def test_more_than_50_same_epoch_gp_id_tie_break_sql_limit(
+    service: HistoricalSelectionService, memory_storage: OrbitStorage
+) -> None:
+    """With >50 records sharing identical epoch and no creation date, the SQL ordering ensures the highest GP_ID winner is returned."""
+    epoch = "2023-06-01T00:00:00Z"
+    # Insert 60 records sharing the exact same epoch
+    # Record 1 is inserted first (surrogate id = 1), but carries the highest gp_id (999999)
+    # Records 2..60 have lower gp_id values
+    recs = []
+    for i in range(1, 61):
+        recs.append(
+            make_rec(
+                epoch=epoch,
+                gp_id=999999 if i == 1 else 1000 + i,
+                creation_date=None,
+                mean_motion=15.5,
+            )
+        )
+    memory_storage.batch_insert_history(recs)
+
+    res = service.select_record(25544, "2023-06-01T04:00:00Z")
+
+    assert res.record is not None
+    # Highest GP_ID (999999) must be selected despite being inserted first (id=1)
+    assert res.gp_id == 999999
+    assert res.record_id == 1
+
+
+def test_subsequent_candidates_same_epoch_tie_break(
+    service: HistoricalSelectionService, memory_storage: OrbitStorage
+) -> None:
+    """Subsequent candidate query orders by epoch ASC, then creation_date DESC, gp_id DESC."""
+    epoch_future = "2023-06-02T00:00:00Z"
+    rec_old_pub = make_rec(
+        epoch=epoch_future,
+        creation_date="2023-06-02T01:00:00Z",
+        gp_id=2001,
+    )
+    rec_new_pub = make_rec(
+        epoch=epoch_future,
+        creation_date="2023-06-02T05:00:00Z",
+        gp_id=2002,
+    )
+    memory_storage.batch_insert_history([rec_old_pub, rec_new_pub])
+
+    res = service.select_record(25544, "2023-06-01T00:00:00Z")
+
+    assert res.quality == "unavailable"
+    assert res.metadata.subsequent_candidate is not None
+    # Context must select rec_new_pub because it has the newer creation date
+    assert res.metadata.subsequent_candidate.gp_id == 2002
+    assert res.metadata.subsequent_candidate.creation_date == "2023-06-02T05:00:00Z"
+
+
+def test_classify_orbital_regime_molniya_and_high_eccentricity() -> None:
+    """High-eccentricity orbits classify as OTHER rather than receiving lenient MEO or GEO thresholds."""
+    # 1. Molniya orbit: ~12-hour period (mean_motion ~ 2.006 rev/day), high eccentricity (e ~ 0.74)
+    rec_molniya = make_rec(mean_motion=2.006, eccentricity=0.74)
+    assert classify_orbital_regime(rec_molniya) == "OTHER"
+
+    # 2. Tundra / high-eccentricity GEO-like orbit: mean_motion ~ 1.002, eccentricity = 0.27 (>= 0.2)
+    rec_tundra = make_rec(mean_motion=1.002, eccentricity=0.27)
+    assert classify_orbital_regime(rec_tundra) == "OTHER"
+
+    # 3. MEO boundary at eccentricity = 0.25 (must be < 0.25 for MEO)
+    rec_meo_ecc_boundary = make_rec(mean_motion=2.005, eccentricity=0.25)
+    assert classify_orbital_regime(rec_meo_ecc_boundary) == "OTHER"
+
+    # 4. GEO boundary at eccentricity = 0.20 (must be < 0.20 for GEO)
+    rec_geo_ecc_boundary = make_rec(mean_motion=1.002, eccentricity=0.20)
+    assert classify_orbital_regime(rec_geo_ecc_boundary) == "OTHER"
+
+
+def test_classify_orbital_regime_standard_regimes() -> None:
+    """Standard low-eccentricity LEO, MEO, and GEO satellites classify correctly."""
+    # LEO: mean_motion > 11.25
+    rec_leo = make_rec(mean_motion=15.5, eccentricity=0.0001)
+    assert classify_orbital_regime(rec_leo) == "LEO"
+
+    # MEO: 1.05 < mean_motion <= 11.25 and eccentricity < 0.25 (e.g. GPS, Galileo)
+    rec_meo = make_rec(mean_motion=2.005, eccentricity=0.008)
+    assert classify_orbital_regime(rec_meo) == "MEO"
+
+    # GEO: 0.95 <= mean_motion <= 1.05 and eccentricity < 0.2 (e.g. GOES)
+    rec_geo = make_rec(mean_motion=1.0027, eccentricity=0.0001)
+    assert classify_orbital_regime(rec_geo) == "GEO"
+
+
+def test_request_regime_validation() -> None:
+    """HistoricalSelectionRequest validates orbital_regime against allowed regimes."""
+    # Valid regimes (case-insensitive)
+    for regime in ("LEO", "MEO", "GEO", "OTHER", "leo", "meo", "geo", "other"):
+        req = HistoricalSelectionRequest(
+            norad_cat_id=25544,
+            timestamp="2023-06-01T00:00:00Z",
+            orbital_regime=regime,  # type: ignore[arg-type]
+        )
+        assert req.orbital_regime == regime.upper()
+
+    # None is valid
+    req_none = HistoricalSelectionRequest(norad_cat_id=25544, timestamp="2023-06-01T00:00:00Z")
+    assert req_none.orbital_regime is None
+
+    # Invalid regimes raise ValidationError
+    for invalid in ("INVALID", "MARS", "HEO", "GTO", "123"):
+        with pytest.raises(ValidationError):
+            HistoricalSelectionRequest(
+                norad_cat_id=25544,
+                timestamp="2023-06-01T00:00:00Z",
+                orbital_regime=invalid,  # type: ignore[arg-type]
+            )
+
+
+def test_regime_thresholds_validation_boundaries_and_inversion() -> None:
+    """RegimeThresholds validates positivity and ordering (nominal_hours <= max_hours)."""
+    # Valid threshold boundaries
+    th_valid = RegimeThresholds(nominal_hours=24.0, max_hours=72.0)
+    assert th_valid.nominal_hours == 24.0
+    assert th_valid.max_hours == 72.0
+
+    # Equal thresholds are valid
+    th_equal = RegimeThresholds(nominal_hours=48.0, max_hours=48.0)
+    assert th_equal.nominal_hours == th_equal.max_hours == 48.0
+
+    # Inverted thresholds raise ValidationError
+    with pytest.raises(ValidationError, match="nominal_hours .* must be less than or equal to max_hours"):
+        RegimeThresholds(nominal_hours=100.0, max_hours=50.0)
+
+    # Zero or negative values raise ValidationError
+    with pytest.raises(ValidationError):
+        RegimeThresholds(nominal_hours=0.0, max_hours=72.0)
+
+    with pytest.raises(ValidationError):
+        RegimeThresholds(nominal_hours=24.0, max_hours=-10.0)
+
+
+def test_request_threshold_overrides_inversion_validation() -> None:
+    """HistoricalSelectionRequest rejects inverted threshold overrides."""
+    with pytest.raises(ValidationError, match="nominal_threshold_hours .* must be less than or equal to"):
+        HistoricalSelectionRequest(
+            norad_cat_id=25544,
+            timestamp="2023-06-01T00:00:00Z",
+            nominal_threshold_hours=100.0,
+            max_epoch_distance_hours=50.0,
+        )

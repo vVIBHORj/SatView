@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Vector3D(BaseModel):
@@ -353,6 +353,7 @@ class IngestionCheckpoint(BaseModel):
 
 
 SelectionQuality = Literal["nominal", "degraded", "unreliable", "unavailable"]
+OrbitalRegimeType = Literal["LEO", "MEO", "GEO", "OTHER"]
 
 
 class RegimeThresholds(BaseModel):
@@ -360,6 +361,14 @@ class RegimeThresholds(BaseModel):
 
     nominal_hours: float = Field(..., gt=0, description="Nominal epoch distance threshold in hours")
     max_hours: float = Field(..., gt=0, description="Maximum operational epoch distance threshold in hours")
+
+    @model_validator(mode="after")
+    def validate_threshold_ordering(self) -> "RegimeThresholds":
+        if self.nominal_hours > self.max_hours:
+            raise ValueError(
+                f"nominal_hours ({self.nominal_hours}) must be less than or equal to max_hours ({self.max_hours})"
+            )
+        return self
 
 
 class SelectionPolicyConfig(BaseModel):
@@ -380,7 +389,11 @@ class SelectionPolicyConfig(BaseModel):
     )
     default_thresholds: RegimeThresholds = Field(
         default_factory=lambda: RegimeThresholds(nominal_hours=24.0, max_hours=72.0),
-        description="Default fallback thresholds when orbital regime is unclassified",
+        description=(
+            "Default fallback thresholds when orbital regime is unclassified or classified as OTHER. "
+            "Currently uses the conservative 24-hour nominal / 72-hour maximum policy as an operational "
+            "fallback, not a scientific guarantee."
+        ),
     )
 
 
@@ -415,7 +428,9 @@ class SelectionMetadata(BaseModel):
         default=None, description="Closest subsequent candidate retained as context"
     )
     alternative_prior_candidates_count: int = Field(
-        default=0, ge=0, description="Count of additional prior candidates available"
+        default=0,
+        ge=0,
+        description="Count of additional prior candidates within the evaluated candidate window",
     )
 
 
@@ -436,9 +451,36 @@ class HistoricalSelectionRequest(BaseModel):
     nominal_threshold_hours: Optional[float] = Field(
         default=None, gt=0, description="Optional override for nominal threshold in hours"
     )
-    orbital_regime: Optional[str] = Field(
+    orbital_regime: Optional[OrbitalRegimeType] = Field(
         default=None, description="Optional explicit regime override ('LEO', 'MEO', 'GEO', 'OTHER')"
     )
+
+    @field_validator("orbital_regime", mode="before")
+    @classmethod
+    def validate_orbital_regime(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("orbital_regime must be a string")
+        upper_v = v.upper().strip()
+        if upper_v not in ("LEO", "MEO", "GEO", "OTHER"):
+            raise ValueError(
+                f"Invalid orbital_regime '{v}'. Must be one of: 'LEO', 'MEO', 'GEO', 'OTHER'"
+            )
+        return upper_v
+
+    @model_validator(mode="after")
+    def validate_threshold_overrides(self) -> "HistoricalSelectionRequest":
+        if (
+            self.nominal_threshold_hours is not None
+            and self.max_epoch_distance_hours is not None
+            and self.nominal_threshold_hours > self.max_epoch_distance_hours
+        ):
+            raise ValueError(
+                f"nominal_threshold_hours ({self.nominal_threshold_hours}) must be less than or equal to "
+                f"max_epoch_distance_hours ({self.max_epoch_distance_hours})"
+            )
+        return self
 
 
 class HistoricalSelectionResult(BaseModel):
